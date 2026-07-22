@@ -1,0 +1,29 @@
+{
+  "project": {
+    "name": "KaRar Twin Villa Project",
+    "version": "0.2",
+    "scale_ratio": 32.0,
+    "default_wall_height": 3.0
+  },
+  "tolerances": {
+    "snapping_distance_mm": 5.0,
+    "collinear_angle_threshold_deg": 2.5,
+    "t_junction_threshold_mm": 20.0
+  },
+  "layers": {
+    "walls": ["duvar", "WALL", "DUVAR"],
+    "columns": ["kolon", "COLUMN", "KOLON"],
+    "doors": ["kapı", "DOOR", "KAPI"],
+    "windows": ["k pencere", "WINDOW", "PENCERE"],
+    "axes": ["aks", "AXIS", "AKS"]
+  },
+  "defaults": {
+    "external_wall_thickness": 0.25,
+    "internal_wall_thickness": 0.15,
+    "door_width": 0.90,
+    "door_height": 2.10,
+    "window_width": 1.20,
+    "window_height": 1.50,
+    "window_elevation": 0.90
+  }
+}

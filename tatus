@@ -1,0 +1,83 @@
+[1mdiff --git a/backend/geometry_engine.py b/backend/geometry_engine.py[m
+[1mindex 6f69c3b..46dfe82 100644[m
+[1m--- a/backend/geometry_engine.py[m
+[1m+++ b/backend/geometry_engine.py[m
+[36m@@ -1,55 +1,21 @@[m
+[31m-import json[m
+[31m-from shapely.geometry import LineString[m
+[31m-[m
+[31m-JSON_FILE = r"C:\KaRar\outputs\walls_clean.json"[m
+[31m-[m
+[31m-with open(JSON_FILE, "r", encoding="utf-8") as f:[m
+[31m-    walls = json.load(f)[m
+[31m-[m
+[31m-lines = [][m
+[31m-points = [][m
+[31m-[m
+[31m-for wall in walls:[m
+[31m-[m
+[31m-    if wall["type"] == "LINE":[m
+[31m-[m
+[31m-        p1 = tuple(wall["start"])[m
+[31m-        p2 = tuple(wall["end"])[m
+[31m-[m
+[31m-        lines.append(LineString([p1, p2]))[m
+[31m-        points.append(p1)[m
+[31m-        points.append(p2)[m
+[31m-[m
+[31m-    elif wall["type"] == "LWPOLYLINE":[m
+[31m-[m
+[31m-        pts = [tuple(p) for p in wall["points"]][m
+[31m-[m
+[31m-        lines.append(LineString(pts))[m
+[31m-[m
+[31m-        for p in pts:[m
+[31m-            points.append(p)[m
+[31m-[m
+[31m-print("--------------------------------")[m
+[31m-print("Toplam Geometri :", len(lines))[m
+[31m-print("Toplam Nokta :", len(points))[m
+[31m-[m
+[31m-unique = set(points)[m
+[31m-[m
+[31m-print("Benzersiz Nokta :", len(unique))[m
+[31m-[m
+[31m-endpoint_count = {}[m
+[31m-[m
+[31m-for p in points:[m
+[31m-    endpoint_count[p] = endpoint_count.get(p, 0) + 1[m
+[31m-[m
+[31m-single = [p for p, c in endpoint_count.items() if c == 1][m
+[31m-[m
+[31m-print("Açık Uç Sayısı :", len(single))[m
+[31m-[m
+[31m-print("--------------------------------")[m
+[31m-print("İlk 20 Açık Uç")[m
+[31m-[m
+[31m-for p in single[:20]:[m
+[31m-    print(p)[m
+[31m-[m
+[31m-print("--------------------------------")[m
+\ No newline at end of file[m
+[32m+[m[32mimport ezdxf[m
+[32m+[m
+[32m+[m[32mclass GeometryEngine:[m
+[32m+[m[32m    def __init__(self):[m
+[32m+[m[32m        pass[m
+[32m+[m[41m    [m
+[32m+[m[32m    def read_dxf(self, file_path: str) -> None:[m
+[32m+[m[32m        self.doc = ezdxf.readfile(file_path)[m
+[32m+[m[32m        self.modelspace = self.doc.modelspace()[m
+[32m+[m[41m    [m
+[32m+[m[32m    def classify_entities(self) -> dict:[m
+[32m+[m[32m        classified_entities = {'LINE': [], 'LWPOLYLINE': []}[m
+[32m+[m[41m        [m
+[32m+[m[32m        for entity in self.modelspace:[m
+[32m+[m[32m            if entity.dxftype() == 'LINE':[m
+[32m+[m[32m                classified_entities['LINE'].append(entity)[m
+[32m+[m[41m                [m
+[32m+[m[32m            elif entity.dxftype() == 'LWPOLYLINE':[m
+[32m+[m[32m                classified_entities['LWPOLYLINE'].append(entity)[m
+[32m+[m[41m            [m
+[32m+[m[32m        return classified_entities[m
+\ No newline at end of file[m

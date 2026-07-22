@@ -1,0 +1,8 @@
+{
+  "name": "KaRar CAD to BIM",
+  "description": "Yapay zekâ destekli mimari CAD (2D DXF) analiz, katman ayrıştırma ve 3D BIM model üretim platformu.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
