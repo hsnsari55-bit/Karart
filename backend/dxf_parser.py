@@ -177,6 +177,24 @@ class DXFParser:
 
         msp = doc.modelspace()
         
+        # Determine unit scale factor from $INSUNITS header variable
+        insunits = 0
+        try:
+            if doc and hasattr(doc, 'header') and '$INSUNITS' in doc.header:
+                insunits = doc.header['$INSUNITS']
+        except Exception:
+            pass
+
+        unit_scale_map = {
+            1: 25.4,   # Inches to mm
+            2: 304.8,  # Feet to mm
+            4: 1.0,    # Millimeters
+            5: 10.0,   # Centimeters to mm
+            6: 1000.0  # Meters to mm
+        }
+        scale_factor = unit_scale_map.get(insunits, 1.0)
+        self.logger.info(f"Detected DXF $INSUNITS={insunits}, unit scale factor to mm: {scale_factor}")
+
         self.entities = []
         self.min_x = float('inf')
         self.min_y = float('inf')
@@ -185,6 +203,28 @@ class DXFParser:
 
         for entity in msp:
             self._process_entity(entity)
+
+        # Apply scale factor to all parsed entities for unit normalization
+        if scale_factor != 1.0:
+            for ent in self.entities:
+                if ent['type'] == 'LINE':
+                    ent['start']['x'] *= scale_factor
+                    ent['start']['y'] *= scale_factor
+                    ent['start']['z'] *= scale_factor
+                    ent['end']['x'] *= scale_factor
+                    ent['end']['y'] *= scale_factor
+                    ent['end']['z'] *= scale_factor
+                elif ent['type'] in ['LWPOLYLINE', 'POLYLINE']:
+                    for v in ent.get('vertices', []):
+                        v['x'] *= scale_factor
+                        v['y'] *= scale_factor
+                        v['z'] *= scale_factor
+                elif ent['type'] in ['TEXT', 'MTEXT']:
+                    ent['position']['x'] *= scale_factor
+                    ent['position']['y'] *= scale_factor
+                    ent['position']['z'] *= scale_factor
+                    ent['height'] *= scale_factor
+            self.logger.info(f"Applied unit scale factor {scale_factor} to {len(self.entities)} entities.")
 
         # Handle block filter or smart block promotion
         if len(self.entities) == 0 and hasattr(doc, 'blocks'):

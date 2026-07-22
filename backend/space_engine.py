@@ -56,57 +56,57 @@ class SpaceEngine:
                 b = ls.bounds
                 wall_rtree.insert(i, b)
                 
-        # 2. Extract Dangling Nodes to prevent room leakage
-        # A room leaks if walls don't connect across a doorway or opening.
+        # 2. Extract Dangling Nodes and apply Iterative Retry Gap Closing
         danglings = [n for n in nodes if n.get('degree', 0) == 1]
-        self.logger.info(f"Found {len(danglings)} dangling wall nodes. Closing gaps for room leakage...")
+        self.logger.info(f"Found {len(danglings)} dangling wall nodes. Starting iterative gap closing retry mechanism...")
         
-        virtual_lines = []
-        dangling_rtree = index.Index()
-        for i, n in enumerate(danglings):
-            dangling_rtree.insert(i, (n['x'], n['y'], n['x'], n['y']))
-            
-        gap_threshold = 400.0  # Max typical door/opening size
-        
-        for i, n in enumerate(danglings):
-            bx = (n['x'] - gap_threshold, n['y'] - gap_threshold, n['x'] + gap_threshold, n['y'] + gap_threshold)
-            neighbors = list(dangling_rtree.intersection(bx))
-            for j in neighbors:
-                if i < j:
-                    n2 = danglings[j]
-                    dist = math.hypot(n['x']-n2['x'], n['y']-n2['y'])
-                    if 10 < dist <= gap_threshold:
-                        virtual_lines.append(LineString([(n['x'], n['y']), (n2['x'], n2['y'])]))
-                        
-        self.stats["Virtual Boundaries"] = len(virtual_lines)
-        self.logger.info(f"Created {len(virtual_lines)} virtual boundaries to seal rooms.")
-        
-        # 3. Polygonize (Walls + Virtual Boundaries)
-        all_lines = [wl for _, wl in wall_lines] + virtual_lines
-        self.logger.info("Noding and Polygonizing to extract closed spaces...")
-        
-        noded = unary_union(all_lines)
-        if noded.geom_type == 'MultiLineString':
-            final_lines = list(noded.geoms)
-        elif noded.geom_type == 'LineString':
-            final_lines = [noded]
-        else:
-            final_lines = []
-            
-        polygons = list(polygonize(final_lines))
-        self.stats["Total Polygons"] = len(polygons)
-        
+        max_retries = 3
+        gap_thresholds = [400.0, 800.0, 1200.0]
         spaces = []
-        # Area threshold to filter out wall thicknesses and small columns
-        MIN_SPACE_AREA = 5000.0 
+        virtual_lines = []
         
-        for poly in polygons:
-            area = poly.area
-            if area >= MIN_SPACE_AREA:
-                spaces.append(poly)
+        for attempt in range(max_retries):
+            gap_threshold = gap_thresholds[attempt]
+            virtual_lines = []
+            dangling_rtree = index.Index()
+            for i, n in enumerate(danglings):
+                dangling_rtree.insert(i, (n['x'], n['y'], n['x'], n['y']))
                 
+            for i, n in enumerate(danglings):
+                bx = (n['x'] - gap_threshold, n['y'] - gap_threshold, n['x'] + gap_threshold, n['y'] + gap_threshold)
+                neighbors = list(dangling_rtree.intersection(bx))
+                for j in neighbors:
+                    if i < j:
+                        n2 = danglings[j]
+                        dist = math.hypot(n['x']-n2['x'], n['y']-n2['y'])
+                        if 10 < dist <= gap_threshold:
+                            virtual_lines.append(LineString([(n['x'], n['y']), (n2['x'], n2['y'])]))
+                            
+            self.stats["Virtual Boundaries"] = len(virtual_lines)
+            
+            # 3. Polygonize (Walls + Virtual Boundaries)
+            all_lines = [wl for _, wl in wall_lines] + virtual_lines
+            noded = unary_union(all_lines)
+            if noded.geom_type == 'MultiLineString':
+                final_lines = list(noded.geoms)
+            elif noded.geom_type == 'LineString':
+                final_lines = [noded]
+            else:
+                final_lines = []
+                
+            polygons = list(polygonize(final_lines))
+            self.stats["Total Polygons"] = len(polygons)
+            
+            MIN_SPACE_AREA = 5000.0 
+            spaces = [poly for poly in polygons if poly.area >= MIN_SPACE_AREA]
+            
+            if len(spaces) > 0 or attempt == max_retries - 1:
+                self.logger.info(f"Gap closing successful on attempt {attempt+1} (threshold: {gap_threshold}mm): found {len(spaces)} valid spaces.")
+                break
+            else:
+                self.logger.warning(f"Gap closing attempt {attempt+1} (threshold: {gap_threshold}mm) yielded 0 spaces. Retrying with increased threshold...")
+
         self.stats["Valid Spaces"] = len(spaces)
-        self.logger.info(f"Found {len(spaces)} valid rooms/spaces (Area >= {MIN_SPACE_AREA}).")
         
         # 4. Map Boundary Walls and Neighbors
         space_outputs = []

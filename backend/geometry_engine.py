@@ -192,6 +192,17 @@ class GeometryEngine:
             raw_data = json.load(f)
             
         entities = raw_data.get('entities', [])
+        
+        # Compute adaptive fuzzy snapping tolerance based on drawing bounding box extent
+        bbox = raw_data.get('bounding_box', {})
+        dx = bbox.get('max_x', 0.0) - bbox.get('min_x', 0.0)
+        dy = bbox.get('max_y', 0.0) - bbox.get('min_y', 0.0)
+        extent = max(dx, dy)
+        if extent > 0:
+            adaptive_tol = max(1.0, min(15.0, extent * 0.0005))
+            self.snap_tolerance = adaptive_tol
+            self.logger.info(f"Adaptive fuzzy snapping tolerance computed: {round(self.snap_tolerance, 2)}mm (drawing extent: {round(extent, 2)})")
+
         wall_layers = [w.lower() for w in self.config.get_layer_mapping("walls")] + ['walls', 'duvar', 'duvarlar']
         
         wall_entities = []

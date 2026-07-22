@@ -15,6 +15,8 @@ from path_manager import PathManager
 from dxf_parser import DXFParser
 from geometry_engine import GeometryEngine
 from topology_engine import TopologyEngine
+from constraint_solver import ConstraintSolver
+from topology_validator import TopologyValidator
 from semantic_engine import SemanticEngine
 from space_engine import SpaceEngine
 from bim_core import BIMCoreEngine
@@ -63,6 +65,8 @@ class RegressionTester:
         self.parser = DXFParser()
         self.geometry_engine = GeometryEngine()
         self.topology_engine = TopologyEngine()
+        self.constraint_solver = ConstraintSolver()
+        self.topology_validator = TopologyValidator()
         self.semantic_engine = SemanticEngine()
         self.space_engine = SpaceEngine()
         self.bim_core_engine = BIMCoreEngine()
@@ -154,6 +158,14 @@ class RegressionTester:
             report["metrics"]["topology_accuracy"] = 100.0 if ("nodes" in graph and is_topology_deterministic) else 0.0
             report["counts"]["nodes"] = len(graph.get("nodes", []))
             report["counts"]["edges"] = topo_edges_count
+            
+            # Step 3b: Constraint Solver & Topology Validator (Mandatory Blocking Gate)
+            s_time = time.time()
+            self.logger.info("  Step 3b: Constraint Solver & Topology Validator...")
+            resolved_graph = self.constraint_solver.run(graph)
+            self.topology_validator.validate(resolved_graph)
+            elapsed_constraint = int((time.time() - s_time) * 1000)
+            report["steps"]["constraint_solver"] = {"status": "SUCCESS", "time_ms": elapsed_constraint}
             
             # Step 4: Semantic Classification
             s_time = time.time()

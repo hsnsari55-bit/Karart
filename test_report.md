@@ -1,6 +1,6 @@
 # KaRar AI - Production Validation & Benchmark Report (v1.0.0-RC1)
 
-**Rapor Tarihi:** 2026-07-22 09:03:39
+**Rapor Tarihi:** 2026-07-22 19:14:49
 **Platform Versiyonu:** `v1.0.0-RC1`
 
 > **KAPSAM VE YÖNETİCİ BİLDİRİMİ (SCOPE & DISCLAIMER):**
@@ -23,32 +23,32 @@
 - **Başarılı Çalıştırma:** 20 / 20
 - **Hata Alan Proje:** 0
 - **Referans Set Başarı Oranı:** `% 100.0` *(Scoped to 20 DXF reference set)*
-- **Toplam İşlem Süresi:** 1.061 saniye
-- **Proje Başına Ortalama Süre:** 53.0 ms
+- **Toplam İşlem Süresi:** 0.975 saniye
+- **Proje Başına Ortalama Süre:** 48.8 ms
 
 ## 4. Proje Bazlı Detaylı Doğrulama Tablosu (Validation Matrix)
 | No | Proje Adı | Parser | Geometry | Topology | Semantic | Space | BIM | 3D | IFC | Durum | Süre (ms) |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| 01 | `01_konut_standard.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 57 |
-| 02 | `02_konut_luks.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 52 |
-| 03 | `03_villa_dublex.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 51 |
-| 04 | `04_villa_triplex.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 56 |
-| 05 | `05_ofis_openplan.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 54 |
-| 06 | `06_ofis_bento.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 57 |
-| 07 | `07_hastane_clinic.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 65 |
+| 01 | `01_konut_standard.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 55 |
+| 02 | `02_konut_luks.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 55 |
+| 03 | `03_villa_dublex.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 46 |
+| 04 | `04_villa_triplex.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 57 |
+| 05 | `05_ofis_openplan.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 40 |
+| 06 | `06_ofis_bento.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 50 |
+| 07 | `07_hastane_clinic.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 55 |
 | 08 | `08_hastane_emergency.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 61 |
 | 09 | `09_okul_siniflar.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 62 |
-| 10 | `10_okul_idari.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 57 |
-| 11 | `11_otel_kat.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 69 |
-| 12 | `12_otel_suite.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 49 |
-| 13 | `13_restoran_bistro.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 47 |
+| 10 | `10_okul_idari.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 42 |
+| 11 | `11_otel_kat.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 67 |
+| 12 | `12_otel_suite.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 45 |
+| 13 | `13_restoran_bistro.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 42 |
 | 14 | `14_restoran_mutfak.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 43 |
-| 15 | `15_spor_gym.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 49 |
-| 16 | `16_muze_gallery.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 56 |
-| 17 | `17_kutuphane_calisma.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 51 |
-| 18 | `18_lab_kimya.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 49 |
-| 19 | `19_kafe_shop.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 37 |
-| 20 | `20_market_gida.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 39 |
+| 15 | `15_spor_gym.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 39 |
+| 16 | `16_muze_gallery.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 44 |
+| 17 | `17_kutuphane_calisma.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 48 |
+| 18 | `18_lab_kimya.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 42 |
+| 19 | `19_kafe_shop.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 41 |
+| 20 | `20_market_gida.dxf` | 100% | 100% | 100% | 100% | 100% | 100% | 100% | 100% | **✅ SUCCESS** | 41 |
 
 ## 5. Katman ve Nesne Analiz Dağılımı
 | No | Referans Planı | Duvar Segmenti | Topological Düğüm | Topological Kenar | Çıkarılan Mahal |
@@ -77,35 +77,35 @@
 ## 6. Geometry & Topology Engine Benchmark Metrikleri
 | No | Proje Adı | Geo Determinizm | Geo SHA-256 | Geo Süre (ms) | Geo Throughput | Topo Determinizm | Topo SHA-256 | Topo Süre (ms) | Topo Throughput |
 |---|---|---|---|---|---|---|---|---|---|
-| 01 | `01_konut_standard.dxf` | ✅ Deterministic | `16e0aa0e1b43` | 7 | 857.14 seg/s | ✅ Deterministic | `403c2f872e42` | 9 | 1111.11 edge/s |
-| 02 | `02_konut_luks.dxf` | ✅ Deterministic | `59d13ffea118` | 4 | 1750.0 seg/s | ✅ Deterministic | `805c731afdaa` | 9 | 1444.44 edge/s |
-| 03 | `03_villa_dublex.dxf` | ✅ Deterministic | `df25eeab6524` | 4 | 1500.0 seg/s | ✅ Deterministic | `247ded516038` | 10 | 1000.0 edge/s |
-| 04 | `04_villa_triplex.dxf` | ✅ Deterministic | `b8ca2042e1ae` | 6 | 1166.67 seg/s | ✅ Deterministic | `c60925a9a887` | 9 | 1444.44 edge/s |
-| 05 | `05_ofis_openplan.dxf` | ✅ Deterministic | `41f8039b67d7` | 6 | 833.33 seg/s | ✅ Deterministic | `4f19968da2f8` | 10 | 700.0 edge/s |
-| 06 | `06_ofis_bento.dxf` | ✅ Deterministic | `d1ddcb136104` | 5 | 1400.0 seg/s | ✅ Deterministic | `7249ef87da94` | 15 | 866.67 edge/s |
-| 07 | `07_hastane_clinic.dxf` | ✅ Deterministic | `dca973cec449` | 4 | 2000.0 seg/s | ✅ Deterministic | `36518e62e67f` | 7 | 2285.71 edge/s |
-| 08 | `08_hastane_emergency.dxf` | ✅ Deterministic | `f35b6f72e8a9` | 5 | 1800.0 seg/s | ✅ Deterministic | `de0614145b9f` | 10 | 1900.0 edge/s |
-| 09 | `09_okul_siniflar.dxf` | ✅ Deterministic | `c1a9b3f5544e` | 6 | 1166.67 seg/s | ✅ Deterministic | `d206fbfaf319` | 13 | 1000.0 edge/s |
-| 10 | `10_okul_idari.dxf` | ✅ Deterministic | `c56d82c2d169` | 5 | 1200.0 seg/s | ✅ Deterministic | `61659f57e83c` | 7 | 1428.57 edge/s |
-| 11 | `11_otel_kat.dxf` | ✅ Deterministic | `91e79d0ab4b7` | 8 | 1125.0 seg/s | ✅ Deterministic | `35d859df511c` | 9 | 2111.11 edge/s |
-| 12 | `12_otel_suite.dxf` | ✅ Deterministic | `7749d5ae9c0d` | 5 | 1200.0 seg/s | ✅ Deterministic | `de4536a3903a` | 12 | 833.33 edge/s |
-| 13 | `13_restoran_bistro.dxf` | ✅ Deterministic | `98d452949316` | 4 | 1250.0 seg/s | ✅ Deterministic | `43cbb5c94dc6` | 8 | 875.0 edge/s |
-| 14 | `14_restoran_mutfak.dxf` | ✅ Deterministic | `097da2ee5a05` | 4 | 1250.0 seg/s | ✅ Deterministic | `cb01b1d8b888` | 6 | 1166.67 edge/s |
-| 15 | `15_spor_gym.dxf` | ✅ Deterministic | `af670bf778fe` | 5 | 1000.0 seg/s | ✅ Deterministic | `1bf4564ef763` | 6 | 1166.67 edge/s |
-| 16 | `16_muze_gallery.dxf` | ✅ Deterministic | `fb69b6283cd2` | 10 | 600.0 seg/s | ✅ Deterministic | `f427ccce454f` | 7 | 1428.57 edge/s |
-| 17 | `17_kutuphane_calisma.dxf` | ✅ Deterministic | `353d90cdde71` | 8 | 750.0 seg/s | ✅ Deterministic | `8df526938e5e` | 8 | 1250.0 edge/s |
-| 18 | `18_lab_kimya.dxf` | ✅ Deterministic | `49950159de24` | 6 | 1000.0 seg/s | ✅ Deterministic | `0181386c57ee` | 7 | 1428.57 edge/s |
-| 19 | `19_kafe_shop.dxf` | ✅ Deterministic | `858cd4a413e6` | 4 | 1250.0 seg/s | ✅ Deterministic | `86e5af78cda1` | 5 | 1400.0 edge/s |
-| 20 | `20_market_gida.dxf` | ✅ Deterministic | `e2642b069303` | 4 | 1250.0 seg/s | ✅ Deterministic | `0886f397c57d` | 5 | 1400.0 edge/s |
+| 01 | `01_konut_standard.dxf` | ✅ Deterministic | `bad027ea9cf3` | 9 | 666.67 seg/s | ✅ Deterministic | `77d59e9efd74` | 10 | 1000.0 edge/s |
+| 02 | `02_konut_luks.dxf` | ✅ Deterministic | `18de6adcd2bc` | 5 | 1400.0 seg/s | ✅ Deterministic | `16161220d475` | 10 | 1300.0 edge/s |
+| 03 | `03_villa_dublex.dxf` | ✅ Deterministic | `877c88de420f` | 4 | 1500.0 seg/s | ✅ Deterministic | `2d5055a02117` | 6 | 1666.67 edge/s |
+| 04 | `04_villa_triplex.dxf` | ✅ Deterministic | `8b108afe5a44` | 6 | 1166.67 seg/s | ✅ Deterministic | `351c6d3a5b44` | 9 | 1444.44 edge/s |
+| 05 | `05_ofis_openplan.dxf` | ✅ Deterministic | `78bca56930cd` | 6 | 833.33 seg/s | ✅ Deterministic | `fb2e698298b7` | 5 | 1400.0 edge/s |
+| 06 | `06_ofis_bento.dxf` | ✅ Deterministic | `69095b8e22e4` | 5 | 1400.0 seg/s | ✅ Deterministic | `787f1b4fecfa` | 7 | 1857.14 edge/s |
+| 07 | `07_hastane_clinic.dxf` | ✅ Deterministic | `f4f65ee72f4c` | 6 | 1333.33 seg/s | ✅ Deterministic | `276a0ad05f29` | 8 | 2000.0 edge/s |
+| 08 | `08_hastane_emergency.dxf` | ✅ Deterministic | `c92b0ef67eaa` | 5 | 1800.0 seg/s | ✅ Deterministic | `ab5e435ab22a` | 8 | 2375.0 edge/s |
+| 09 | `09_okul_siniflar.dxf` | ✅ Deterministic | `d63bda9e457d` | 10 | 700.0 seg/s | ✅ Deterministic | `5dde01304702` | 10 | 1300.0 edge/s |
+| 10 | `10_okul_idari.dxf` | ✅ Deterministic | `a6cce499b929` | 4 | 1500.0 seg/s | ✅ Deterministic | `4ee6ccc8e219` | 6 | 1666.67 edge/s |
+| 11 | `11_otel_kat.dxf` | ✅ Deterministic | `41ac76d62055` | 7 | 1285.71 seg/s | ✅ Deterministic | `762a70a9ebb5` | 9 | 2111.11 edge/s |
+| 12 | `12_otel_suite.dxf` | ✅ Deterministic | `c46ca9c283f8` | 4 | 1500.0 seg/s | ✅ Deterministic | `53530d20ce27` | 6 | 1666.67 edge/s |
+| 13 | `13_restoran_bistro.dxf` | ✅ Deterministic | `dd909317a0aa` | 5 | 1000.0 seg/s | ✅ Deterministic | `b8f2f20fc567` | 5 | 1400.0 edge/s |
+| 14 | `14_restoran_mutfak.dxf` | ✅ Deterministic | `8154a5bb2b40` | 5 | 1000.0 seg/s | ✅ Deterministic | `b3656a8478ae` | 7 | 1000.0 edge/s |
+| 15 | `15_spor_gym.dxf` | ✅ Deterministic | `bad01a92619b` | 3 | 1666.67 seg/s | ✅ Deterministic | `ea23fda4cbe2` | 7 | 1000.0 edge/s |
+| 16 | `16_muze_gallery.dxf` | ✅ Deterministic | `62ee54a9206c` | 4 | 1500.0 seg/s | ✅ Deterministic | `e1a1f042d736` | 8 | 1250.0 edge/s |
+| 17 | `17_kutuphane_calisma.dxf` | ✅ Deterministic | `e8f71dcbcd64` | 5 | 1200.0 seg/s | ✅ Deterministic | `5b247efa4af7` | 9 | 1111.11 edge/s |
+| 18 | `18_lab_kimya.dxf` | ✅ Deterministic | `6a54d43c3013` | 5 | 1200.0 seg/s | ✅ Deterministic | `bc58a1b8f033` | 6 | 1666.67 edge/s |
+| 19 | `19_kafe_shop.dxf` | ✅ Deterministic | `124b27d113c4` | 5 | 1000.0 seg/s | ✅ Deterministic | `4258c16e918d` | 6 | 1166.67 edge/s |
+| 20 | `20_market_gida.dxf` | ✅ Deterministic | `9c601589e52e` | 3 | 1666.67 seg/s | ✅ Deterministic | `27e520ee1053` | 5 | 1400.0 edge/s |
 
 ## 7. Edge-Case & Sentetik Stres Benchmark Testleri
 | Test Senaryosu | Açıklama | Girdi Adedi | Çıktı / Mahal | Determinizm | Süre (ms) | Durum |
 |---|---|---|---|---|---|---|
-| **Sıfır Uzunluklu Segmentler (Zero-Length)** | Başlangıç ve bitiş noktası aynı olan (0,0)->(0,0) hatalı segmentlerin filtrelenmesi | 4 | 2 | ✅ Yes (SHA-256) | 3 ms | **PASSED** |
-| **Mikro Boşluklar & Kolineer Çakışmalar (Micro-Gaps & Overlaps)** | 0.005mm mikro boşluk ve üst üste binen kolineer duvar segmentlerinin birleştirilmesi | 3 | 2 | ✅ Yes (SHA-256) | 3 ms | **PASSED** |
-| **Açık Poligonlar & Serbest Uçlar (Open Loops & Dangling)** | Kapanmamış duvar uçlarında SpaceEngine dinamik sınır kapama (room leakage sealing) | 4 | 2 | ✅ Yes (SHA-256) | 10 ms | **PASSED** |
-| **İç İçe Blok Hiyerarşisi (Nested Block INSERT)** | Blok içi (Block Name) lokal koordinatlarda tanımlanmış duvar gruplarının dönüştürülmesi | 4 | 4 | ✅ Yes (SHA-256) | 4 ms | **PASSED** |
-| **Büyük CAD Ölçeği (Synthetic Large Grid - 1,220 Segment)** | 1,220 duvar segmentinden oluşan karmaşık 20x20 oda izgarası stres testi | 42 | 840 | ✅ Yes (SHA-256) | 313 ms | **PASSED** |
+| **Sıfır Uzunluklu Segmentler (Zero-Length)** | Başlangıç ve bitiş noktası aynı olan (0,0)->(0,0) hatalı segmentlerin filtrelenmesi | 4 | 2 | ✅ Yes (SHA-256) | 2 ms | **PASSED** |
+| **Mikro Boşluklar & Kolineer Çakışmalar (Micro-Gaps & Overlaps)** | 0.005mm mikro boşluk ve üst üste binen kolineer duvar segmentlerinin birleştirilmesi | 3 | 2 | ✅ Yes (SHA-256) | 2 ms | **PASSED** |
+| **Açık Poligonlar & Serbest Uçlar (Open Loops & Dangling)** | Kapanmamış duvar uçlarında SpaceEngine dinamik sınır kapama (room leakage sealing) | 4 | 2 | ✅ Yes (SHA-256) | 8 ms | **PASSED** |
+| **İç İçe Blok Hiyerarşisi (Nested Block INSERT)** | Blok içi (Block Name) lokal koordinatlarda tanımlanmış duvar gruplarının dönüştürülmesi | 4 | 4 | ✅ Yes (SHA-256) | 5 ms | **PASSED** |
+| **Büyük CAD Ölçeği (Synthetic Large Grid - 1,220 Segment)** | 1,220 duvar segmentinden oluşan karmaşık 20x20 oda izgarası stres testi | 42 | 840 | ✅ Yes (SHA-256) | 309 ms | **PASSED** |
 
 ## 8. Stabilizasyon & Hata Analizi (Root Cause Analysis)
 - **Collinear Merge Geliştirmesi:** Duvar birleştirme algoritmasındaki hassasiyet ayarlanarak, üst üste binen veya ardışık kolineer çizgiler tam bir bütün haline getirilmiştir. Bu durum, topoloji motorundaki T ve X tipi birleşim hatalarını tamamen sıfırlamıştır.
