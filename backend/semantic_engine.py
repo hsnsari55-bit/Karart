@@ -25,8 +25,13 @@ class SemanticEngine:
         }
 
     def _create_entity(self, etype: str, geom: Any, confidence: float, reason: str, extra: Dict = None) -> Dict:
+        # Construct deterministic seed string from element type and geometry
+        geom_str = json.dumps(geom, sort_keys=True)
+        seed = f"karar_{etype}_{geom_str}"
+        deterministic_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
+        
         ent = {
-            "uuid": str(uuid.uuid4()),
+            "uuid": deterministic_uuid,
             "type": etype,
             "confidence": round(confidence, 2),
             "reason": reason,

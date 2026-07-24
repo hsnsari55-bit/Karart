@@ -115,12 +115,17 @@ class SpaceEngine:
         # We'll buffer slightly to find overlaps, or just look at exact segments
         
         for idx, space_poly in enumerate(spaces):
-            space_uuid = f"space-{uuid.uuid4().hex[:8]}"
             boundary_coords = list(space_poly.exterior.coords)
+            coord_str = json.dumps([{"x": round(p[0], 2), "y": round(p[1], 2)} for p in boundary_coords], sort_keys=True)
+            space_hash = uuid.uuid5(uuid.NAMESPACE_DNS, f"space_{coord_str}").hex[:8]
+            space_uuid = f"space-{space_hash}"
             
             bounded_by_walls = []
             
             # For each segment of the space boundary, find the corresponding Wall
+            # Query adaptive radius based on snapping tolerance to accommodate wall thickness offset
+            search_radius = max(self.config.get("tolerances.snapping_distance_mm", 5.0) * 4.0, 150.0)
+            
             for c_idx in range(len(boundary_coords) - 1):
                 p1 = boundary_coords[c_idx]
                 p2 = boundary_coords[c_idx+1]
@@ -128,7 +133,6 @@ class SpaceEngine:
                 mid_y = (p1[1] + p2[1]) / 2.0
                 
                 # Query R-Tree
-                search_radius = 5.0
                 bx = (mid_x - search_radius, mid_y - search_radius, mid_x + search_radius, mid_y + search_radius)
                 candidates = list(wall_rtree.intersection(bx))
                 

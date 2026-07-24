@@ -57,9 +57,12 @@ export interface PipelineStep {
 }
 
 export interface ChatMessage {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   content: string;
   timestamp: Date;
+  isError?: boolean;
+  stepId?: string;
+  statusCode?: number;
 }
 
 // ==========================================

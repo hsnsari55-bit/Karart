@@ -3,7 +3,10 @@ import json
 import logging
 import uuid
 import math
-from typing import List, Dict, Any
+import time
+import sys
+import hashlib
+import shapely
 
 from backend.path_manager import PathManager
 
@@ -31,12 +34,20 @@ class BIMCoreEngine:
             self.logger.warning("Missing input files for BIM Core.")
             return
 
-        with open(bim_path, 'r', encoding='utf-8') as f:
-            bim_elements = json.load(f).get("elements", [])
-        with open(spaces_path, 'r', encoding='utf-8') as f:
-            spaces = json.load(f).get("spaces", [])
-        with open(graph_path, 'r', encoding='utf-8') as f:
-            graph_data = json.load(f)
+        with open(bim_path, 'rb') as f:
+            sem_bytes = f.read()
+            sem_sha256 = hashlib.sha256(sem_bytes).hexdigest()
+            bim_elements = json.loads(sem_bytes.decode('utf-8')).get("elements", [])
+            
+        with open(spaces_path, 'rb') as f:
+            spaces_bytes = f.read()
+            spaces_sha256 = hashlib.sha256(spaces_bytes).hexdigest()
+            spaces = json.loads(spaces_bytes.decode('utf-8')).get("spaces", [])
+            
+        with open(graph_path, 'rb') as f:
+            graph_bytes = f.read()
+            graph_sha256 = hashlib.sha256(graph_bytes).hexdigest()
+            graph_data = json.loads(graph_bytes.decode('utf-8'))
 
         edges = graph_data.get('edges', [])
         nodes = graph_data.get('nodes', [])
@@ -50,29 +61,26 @@ class BIMCoreEngine:
         # Map edge index in graph to WALL uuid
         edge_idx_to_wall_uuid = {}
 
-        # Since semantic engine loops over edges to create walls first:
-        # the first len(edges) elements in bim_clean might be walls. 
-        # But let's just find them by points to be sure. Or better, just map them directly.
-        # Let's map wall elements to edges by center point or just assume order if they match.
-        
-        # Actually, semantic engine created WALL elements EXACTLY from edges in order?
         wall_elements = [el for el in bim_elements if el.get('type') == 'Wall']
         if len(wall_elements) == len(edges):
             for i, wall in enumerate(wall_elements):
-                wall['uuid'] = str(uuid.uuid4())
+                if 'uuid' not in wall:
+                    seed = f"wall_{wall.get('points')}"
+                    wall['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
                 edge_idx_to_wall_uuid[i] = wall['uuid']
         else:
-            # Fallback mapping
             for i, edge in enumerate(edges):
                 p0 = (nodes[edge['from']]['x'], nodes[edge['from']]['y'])
                 p1 = (nodes[edge['to']]['x'], nodes[edge['to']]['y'])
-                # find matching wall
                 for wall in wall_elements:
-                    if 'uuid' in wall: continue
+                    if 'uuid' in wall: 
+                        edge_idx_to_wall_uuid[i] = wall['uuid']
+                        continue
                     wp0, wp1 = wall['points'][0], wall['points'][1]
                     if (self._distance(p0, wp0) < 1.0 and self._distance(p1, wp1) < 1.0) or \
                        (self._distance(p0, wp1) < 1.0 and self._distance(p1, wp0) < 1.0):
-                        wall['uuid'] = str(uuid.uuid4())
+                        seed = f"wall_{wp0}_{wp1}"
+                        wall['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
                         edge_idx_to_wall_uuid[i] = wall['uuid']
                         break
 
@@ -80,7 +88,8 @@ class BIMCoreEngine:
         bim_idx_to_uuid = {}
         for i, el in enumerate(bim_elements):
             if 'uuid' not in el:
-                el['uuid'] = str(uuid.uuid4())
+                seed = f"{el.get('type')}_{el.get('points') or el.get('boundary') or i}"
+                el['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
             bim_idx_to_uuid[i] = el['uuid']
             
             cat = el.get('type')
@@ -89,9 +98,11 @@ class BIMCoreEngine:
             elif cat == 'Column': columns.append(el)
             elif cat == 'Door': doors.append(el)
 
-        # Map Spaces
+        # Map Spaces (preserve existing space uuid or compute deterministic uuid)
         for sp in spaces:
-            sp['uuid'] = str(uuid.uuid4())
+            if 'uuid' not in sp:
+                seed = f"space_{sp.get('boundary')}"
+                sp['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
             sp['related_walls'] = []
             sp['related_windows'] = []
             sp['related_columns'] = []
@@ -117,15 +128,14 @@ class BIMCoreEngine:
         for w in walls:
             s_list = w['related_spaces']
             if len(s_list) == 2:
-                # the two spaces are neighbors
                 s1_uuid, s2_uuid = s_list[0], s_list[1]
-                s1 = next(s for s in spaces if s['uuid'] == s1_uuid)
-                s2 = next(s for s in spaces if s['uuid'] == s2_uuid)
-                if s2_uuid not in s1['neighbors']: s1['neighbors'].append(s2_uuid)
-                if s1_uuid not in s2['neighbors']: s2['neighbors'].append(s1_uuid)
+                s1 = next((s for s in spaces if s['uuid'] == s1_uuid), None)
+                s2 = next((s for s in spaces if s['uuid'] == s2_uuid), None)
+                if s1 and s2:
+                    if s2_uuid not in s1['neighbors']: s1['neighbors'].append(s2_uuid)
+                    if s1_uuid not in s2['neighbors']: s2['neighbors'].append(s1_uuid)
 
         # 3. Window/Door <-> Wall Relationships
-        # A window/door belongs to a wall if its centroid is close to the wall segment
         for el in windows + doors:
             pts = el.get('points', [])
             if not pts: continue
@@ -144,16 +154,16 @@ class BIMCoreEngine:
             
             if min_dist < 10.0 and closest_wall:
                 el['parent_wall'] = closest_wall
-                # Also assign to spaces that this wall bounds
                 w_spaces = wall_to_spaces[closest_wall]
                 for sp_uuid in w_spaces:
-                    sp = next(s for s in spaces if s['uuid'] == sp_uuid)
-                    if el.get('type') == 'Window':
-                        if el['uuid'] not in sp['related_windows']: sp['related_windows'].append(el['uuid'])
-                    elif el.get('type') == 'Door':
-                        if el['uuid'] not in sp['related_doors']: sp['related_doors'].append(el['uuid'])
+                    sp = next((s for s in spaces if s['uuid'] == sp_uuid), None)
+                    if sp:
+                        if el.get('type') == 'Window':
+                            if el['uuid'] not in sp['related_windows']: sp['related_windows'].append(el['uuid'])
+                        elif el.get('type') == 'Door':
+                            if el['uuid'] not in sp['related_doors']: sp['related_doors'].append(el['uuid'])
 
-        # 4. Column <-> Space (Based on element_indices from space engine)
+        # 4. Column <-> Space
         for sp in spaces:
             for b_idx in sp.get('element_indices', []):
                 el_uuid = bim_idx_to_uuid.get(b_idx)
@@ -164,14 +174,64 @@ class BIMCoreEngine:
                         sp['related_columns'].append(el_uuid)
                     if 'parent_spaces' not in el:
                         el['parent_spaces'] = []
-                    el['parent_spaces'].append(sp['uuid'])
+                    if sp['uuid'] not in el['parent_spaces']:
+                        el['parent_spaces'].append(sp['uuid'])
 
-        # Assemble the Canonical BIM Model
+        # Deterministic sorting helper for BIM elements
+        def _elem_sort_key(el):
+            pts = el.get('points') or el.get('boundary') or []
+            c_x, c_y = 0.0, 0.0
+            if pts:
+                if isinstance(pts[0], list):
+                    c_x = round(sum(p[0] for p in pts if isinstance(p, list)) / max(1, len(pts)), 2)
+                    c_y = round(sum(p[1] for p in pts if isinstance(p, list)) / max(1, len(pts)), 2)
+                elif isinstance(pts[0], dict):
+                    c_x = round(sum(p.get('x', 0) for p in pts if isinstance(p, dict)) / max(1, len(pts)), 2)
+                    c_y = round(sum(p.get('y', 0) for p in pts if isinstance(p, dict)) / max(1, len(pts)), 2)
+            return (el.get('type', ''), c_x, c_y, el.get('uuid', ''))
+
+        walls.sort(key=_elem_sort_key)
+        windows.sort(key=_elem_sort_key)
+        doors.sort(key=_elem_sort_key)
+        columns.sort(key=_elem_sort_key)
+        spaces.sort(key=_elem_sort_key)
+
+        for sp in spaces:
+            sp['related_walls'].sort()
+            sp['related_windows'].sort()
+            sp['related_columns'].sort()
+            sp['related_doors'].sort()
+            sp['neighbors'].sort()
+
+        for w in walls:
+            if 'related_spaces' in w:
+                w['related_spaces'].sort()
+
+        for col in columns:
+            if 'parent_spaces' in col:
+                col['parent_spaces'].sort()
+
+        # Assemble Provenance Envelope Metadata
+        provenance = {
+            "engine": "KaRar BIM Core",
+            "engine_version": "v1.0.0-RC1",
+            "schema_version": "1.0",
+            "python_version": sys.version.split()[0],
+            "shapely_version": getattr(shapely, '__version__', 'unknown'),
+            "generated_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            "input_hashes": {
+                "bim_semantics_sha256": sem_sha256,
+                "spaces_sha256": spaces_sha256,
+                "geometry_graph_sha256": graph_sha256
+            }
+        }
+
         canonical_model = {
             "metadata": {
                 "version": "1.0",
-                "generated_by": "KaRar BIM Core"
+                "generated_by": "KaRar BIM Core Engine"
             },
+            "provenance": provenance,
             "spaces": spaces,
             "walls": walls,
             "windows": windows,
@@ -179,11 +239,16 @@ class BIMCoreEngine:
             "doors": doors
         }
 
+        output_bytes = json.dumps(canonical_model, indent=4, sort_keys=True).encode('utf-8')
+        canonical_sha256 = hashlib.sha256(output_bytes).hexdigest()
+        canonical_model["provenance"]["canonical_bim_sha256"] = canonical_sha256
+
         output_path = self.path_manager.get_path('outputs', 'bim_model.json')
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(canonical_model, f, indent=4)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, 'wb') as f:
+            f.write(json.dumps(canonical_model, indent=4, sort_keys=True).encode('utf-8'))
             
-        self.logger.info(f"Canonical BIM Model generated with {len(spaces)} spaces, {len(walls)} walls, {len(windows)} windows.")
+        self.logger.info(f"Canonical BIM Model generated with {len(spaces)} spaces, {len(walls)} walls, {len(windows)} windows. SHA-256: {canonical_sha256[:12]}")
         return canonical_model
 
 if __name__ == '__main__':

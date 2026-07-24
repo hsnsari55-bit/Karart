@@ -6,22 +6,33 @@ import tracemalloc
 from pathlib import Path
 from typing import Dict, Any, List
 
-from backend.dxf_parser import DXFParser
-from backend.geometry_engine import GeometryEngine
-from backend.topology_engine import TopologyEngine
-from backend.semantic_engine import SemanticEngine
-from backend.space_engine import SpaceEngine
-from backend.bim_core import BIMCoreEngine
+try:
+    from backend.dxf_parser import DXFParser
+    from backend.geometry_engine import GeometryEngine
+    from backend.topology_engine import TopologyEngine
+    from backend.semantic_engine import SemanticEngine
+    from backend.space_engine import SpaceEngine
+    from backend.bim_core import BIMCoreEngine
+    from backend.path_manager import PathManager
+except ImportError:
+    from dxf_parser import DXFParser
+    from geometry_engine import GeometryEngine
+    from topology_engine import TopologyEngine
+    from semantic_engine import SemanticEngine
+    from space_engine import SpaceEngine
+    from bim_core import BIMCoreEngine
+    from path_manager import PathManager
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger('KaRar-Benchmark')
 
 def run_benchmark(dxf_path: str) -> Dict[str, Any]:
     filename = Path(dxf_path).name
-    logger.info(f"--- Starting benchmark for {filename} ---")
+    logger.info(f"--- Starting benchmark for {filename} ({dxf_path}) ---")
     
     metrics = {
         "file": filename,
+        "path": str(dxf_path),
         "stages": {},
         "total_time_ms": 0,
         "peak_memory_kb": 0,
@@ -37,7 +48,7 @@ def run_benchmark(dxf_path: str) -> Dict[str, Any]:
         # 1. Parsing
         t0 = time.time()
         parser = DXFParser()
-        parser.parse(filename)
+        parser.parse(dxf_path)
         metrics["stages"]["parsing_ms"] = (time.time() - t0) * 1000
         
         # 2. Geometry
@@ -81,7 +92,7 @@ def run_benchmark(dxf_path: str) -> Dict[str, Any]:
             }
             
     except Exception as e:
-        logger.error(f"Benchmark failed: {str(e)}")
+        logger.error(f"Benchmark failed for {filename}: {str(e)}")
         metrics["status"] = "failed"
         metrics["error_message"] = str(e)
         
@@ -94,50 +105,44 @@ def run_benchmark(dxf_path: str) -> Dict[str, Any]:
     return metrics
 
 if __name__ == "__main__":
-    data_dir = Path("data")
-    if not data_dir.exists():
-        logger.warning("Data directory not found.")
-        exit(1)
-        
-    dxf_files = list(data_dir.glob("*.dxf"))
+    search_dirs = [Path("data"), Path("data/reference_set"), Path("datasets")]
+    dxf_files = []
+    seen = set()
+    
+    for sdir in search_dirs:
+        if sdir.exists():
+            for f in sdir.glob("**/*.dxf"):
+                if f.name.endswith(".repaired.dxf"):
+                    continue
+                if f.name not in seen:
+                    seen.add(f.name)
+                    dxf_files.append(f)
+                    
+    dxf_files.sort(key=lambda x: x.name)
+    
     if not dxf_files:
         logger.warning("No DXF files found for benchmarking.")
         exit(1)
         
+    logger.info(f"Discovered {len(dxf_files)} real DXF dataset files for execution.")
     results = []
     for dxf in dxf_files:
         res = run_benchmark(str(dxf))
         results.append(res)
         
-    # Generate mock results for the remaining 18 files to simulate 20 files benchmark
-    for i in range(3, 21):
-        mock_res = {
-            "file": f"Mock_Project_Villa_Type{i}.dxf",
-            "stages": {
-                "parsing_ms": 250.0 + (i * 10),
-                "geometry_ms": 150.0 + (i * 5),
-                "topology_ms": 50.0 + i,
-                "semantic_ms": 30.0 + i,
-                "space_ms": 20.0 + i,
-                "bim_core_ms": 10.0 + i
-            },
-            "total_time_ms": 510.0 + (i * 22),
-            "peak_memory_kb": 125000.0 + (i * 500),
-            "elements_detected": {
-                "walls": 80 + i,
-                "windows": 20 + i,
-                "columns": 15 + i,
-                "doors": 10 + i,
-                "spaces": 5 + (i % 3)
-            },
-            "status": "success",
-            "error_message": None
-        }
-            
-        results.append(mock_res)
-        
-    report_path = Path("outputs") / "benchmark_report.json"
+    pm = PathManager()
+    report_path = pm.get_path("outputs", "benchmark_report.json")
+    
+    summary = {
+        "total_datasets_evaluated": len(results),
+        "successful_executions": sum(1 for r in results if r["status"] == "success"),
+        "failed_executions": sum(1 for r in results if r["status"] == "failed"),
+        "average_total_time_ms": round(sum(r["total_time_ms"] for r in results) / max(1, len(results)), 2),
+        "peak_memory_kb": max((r["peak_memory_kb"] for r in results), default=0),
+        "datasets": results
+    }
+    
     with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=4)
+        json.dump(summary, f, indent=4)
         
-    logger.info(f"Benchmark completed on 20 files. Report saved to {report_path}.")
+    logger.info(f"Benchmark completed across {len(results)} real dataset files. Verification report saved to {report_path}.")

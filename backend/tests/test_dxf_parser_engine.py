@@ -15,6 +15,7 @@ class TestDXFParserEngine(unittest.TestCase):
 
     def create_test_dxf(self, filepath):
         doc = ezdxf.new(dxfversion='R2010')
+        doc.header['$INSUNITS'] = 4  # Millimeters
         msp = doc.modelspace()
         # Add basic entities
         msp.add_line((0, 0), (10, 10), dxfattribs={'layer': 'Walls'})

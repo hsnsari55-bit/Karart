@@ -3,7 +3,7 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import fs from "fs";
-import { spawn } from "child_process";
+import { spawn, execSync } from "child_process";
 
 async function startServer() {
   const app = express();
@@ -20,8 +20,10 @@ async function startServer() {
   if (!fs.existsSync(dxfRawPath)) {
     console.log("[KaRar] Initializing default project parsing for GÜZELCE 467 ADA 3 PARSEL...");
     try {
-      const { execSync } = require("child_process");
-      execSync("PYTHONPATH=. venv/bin/python3 backend/run_regression_tests.py", { stdio: "inherit" });
+      const pythonCmd = fs.existsSync(path.join(process.cwd(), "venv", "bin", "python3"))
+        ? "venv/bin/python3"
+        : "python3";
+      execSync(`PYTHONPATH=. ${pythonCmd} backend/run_regression_tests.py`, { stdio: "inherit" });
     } catch (e) {
       console.warn("[KaRar] Auto-parsing on startup warning:", e);
     }

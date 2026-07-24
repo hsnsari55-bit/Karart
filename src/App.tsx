@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { mockFloors, pipelineInitialSteps } from "./data/cadData";
-import { Floor, PipelineStepId, CADEntity } from "./types";
+import { Floor, PipelineStepId, CADEntity, ChatMessage } from "./types";
 import CADVisualizer from "./components/CADVisualizer";
 import BIMViewer3D from "./components/BIMViewer3D";
 import AIChatPanel from "./components/AIChatPanel";
@@ -54,6 +54,20 @@ export default function App() {
   const [selectedBlock, setSelectedBlock] = useState<string>("block_a");
   const [bimModel, setBimModel] = useState<any>(null);
 
+  // Chat messages state lifted to App.tsx for real-time error log interception
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
+    {
+      role: "assistant",
+      content:
+        "Merhaba! Ben KaRar Mimari Yapay Zekâ Yardımcısıyım. 'GÜZELCE 467 ADA 9 PARSEL' projenizin parsed CAD ve BIM verilerini inceleyerek sorularınızı yanıtlayabilirim.\n\nDuvar kalınlıkları, kapı adetleri, oda dağılımları veya 3D model ihracı hakkında sorularınızı sorabilirsiniz.",
+      timestamp: new Date(),
+    },
+  ]);
+
+  const addChatMessage = (msg: ChatMessage) => {
+    setChatMessages((prev) => [...prev, msg]);
+  };
+
 
   // Find active floor data from state instead of static imports
   const currentFloor = floors.find((f) => f.id === selectedFloorId) || floors[0];
@@ -74,7 +88,7 @@ export default function App() {
       if (isCleaned && data.bim && data.bim.walls && data.bim.walls.length > 0) {
         // Load the semantic-engine classified elements (or snapped walls if selected)
 
-        const allBimEntities = data.bim.walls ? [...data.bim.walls, ...data.bim.windows, ...data.bim.columns, ...data.bim.doors] : data.bim;
+        const allBimEntities = data.bim.walls ? [...(data.bim.walls || []), ...(data.bim.windows || []), ...(data.bim.columns || []), ...(data.bim.doors || [])] : [];
         mappedEntities = allBimEntities.map((e: any, idx: number) => {
 
           let etype: "LINE" | "ARC" | "COLUMN" | "DOOR" | "WINDOW" = "LINE";
@@ -191,14 +205,53 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ stepId: id, fileName: selectedDXFFileName, blockId: selectedBlock }),
       });
+
+      // Intercept failed HTTP API response (400, 500, etc.)
       if (!res.ok) {
-        throw new Error(`Server returned status: ${res.status}`);
+        let failureReason = `HTTP ${res.status}: ${res.statusText}`;
+        try {
+          const contentType = res.headers.get("content-type") || "";
+          if (contentType.includes("application/json")) {
+            const errJson = await res.json();
+            failureReason = errJson.error || errJson.message || JSON.stringify(errJson);
+          } else {
+            const textBody = await res.text();
+            if (textBody.trim()) failureReason = textBody.trim();
+          }
+        } catch (e) {
+          // ignore parsing error
+        }
+
+        const formattedError = `🚨 **[API STEP RUN FAILURE - ${id.toUpperCase()}]**
+
+- **Endpoint:** \`/api/run-step\`
+- **HTTP Status:** \`${res.status} ${res.statusText}\`
+- **Failure Reason:** \`${failureReason}\`
+- **Target DXF File:** \`${selectedDXFFileName}\`
+- **Block Filter:** \`${selectedBlock}\`
+
+*Lütfen Python çalışma ortamı bağımlılıklarını ve sunucu loglarını kontrol edin.*`;
+
+        addChatMessage({
+          role: "assistant",
+          content: formattedError,
+          timestamp: new Date(),
+          isError: true,
+          stepId: id,
+          statusCode: res.status,
+        });
+
+        const errorLog = `[ERROR] Step ${id} failed with HTTP ${res.status}: ${failureReason}`;
+        if (onLog) onLog(errorLog);
+        setIsRunning(false);
+        return [errorLog];
       }
       
       if (res.body) {
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
+        const errorLines: string[] = [];
 
         while (true) {
           const { done, value } = await reader.read();
@@ -212,12 +265,57 @@ export default function App() {
             if (line.trim()) {
               logs.push(line);
               if (onLog) onLog(line);
+
+              // Intercept error output lines in stream
+              if (
+                line.includes("[ERROR]") ||
+                line.includes("Traceback (most recent call last)") ||
+                line.includes("ModuleNotFoundError") ||
+                line.includes("Process exited with code") ||
+                line.includes("DXFStructureError") ||
+                line.includes("Exception:")
+              ) {
+                errorLines.push(line);
+              }
             }
           }
         }
         if (buffer.trim()) {
           logs.push(buffer);
           if (onLog) onLog(buffer);
+          if (
+            buffer.includes("[ERROR]") ||
+            buffer.includes("Traceback") ||
+            buffer.includes("ModuleNotFoundError") ||
+            buffer.includes("Process exited with code") ||
+            buffer.includes("DXFStructureError") ||
+            buffer.includes("Exception:")
+          ) {
+            errorLines.push(buffer);
+          }
+        }
+
+        if (errorLines.length > 0) {
+          const errorOutput = errorLines.slice(-12).join("\n");
+          const formattedStreamError = `⚠️ **[STEP EXECUTION ERROR CAPTURED - ${id.toUpperCase()}]**
+
+Backend işlemi sırasında çalışma zamanı hatası yakalandı:
+
+- **Adım ID:** \`${id}\`
+- **Hata Özeti / İzleme:**
+\`\`\`
+${errorOutput}
+\`\`\`
+
+💡 *Teşhis:* Python betiği yürütülürken bir istisna oluştu. Hatayı detaylandırmak ve çözüm üretmek için **"🔍 AI ile Hatayı Analiz Et"** butonuna tıklayabilirsiniz.`;
+
+          addChatMessage({
+            role: "assistant",
+            content: formattedStreamError,
+            timestamp: new Date(),
+            isError: true,
+            stepId: id,
+          });
         }
       }
 
@@ -229,7 +327,24 @@ export default function App() {
       return logs;
     } catch (err: any) {
       setIsRunning(false);
-      const errorLog = `[ERROR] Failed to run step ${id}: ${err.message}`;
+      const errorReason = err.message || String(err);
+      const formattedCatchError = `🚨 **[KRİTİK İSTEK HATASI - ${id.toUpperCase()}]**
+
+\`/api/run-step\` isteği gönderilirken istemci tarafında veya ağ seviyesinde bir istisna oluştu:
+
+\`\`\`
+${errorReason}
+\`\`\``;
+
+      addChatMessage({
+        role: "assistant",
+        content: formattedCatchError,
+        timestamp: new Date(),
+        isError: true,
+        stepId: id,
+      });
+
+      const errorLog = `[ERROR] Failed to run step ${id}: ${errorReason}`;
       if (onLog) onLog(errorLog);
       return [errorLog];
     }
@@ -240,7 +355,7 @@ export default function App() {
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: msg }),
+      body: JSON.stringify({ message: msg, history: chatMessages }),
     });
     if (!res.ok) {
       throw new Error(`API error: ${res.statusText}`);
@@ -594,14 +709,19 @@ print("BIM Scene loaded successfully in Blender.")`;
               </button>
               <button
                 onClick={() => setActiveTab("ai")}
-                className={`px-4 py-2 text-xs font-mono font-bold tracking-wider rounded-t-lg border-t-2 transition-all ${
+                className={`px-4 py-2 text-xs font-mono font-bold tracking-wider rounded-t-lg border-t-2 transition-all flex items-center space-x-1.5 ${
                   activeTab === "ai"
                     ? "bg-zinc-900 border-purple-500 text-purple-400"
                     : "border-transparent text-zinc-400 hover:text-zinc-200"
                 }`}
                 id="tab_trigger_ai"
               >
-                AI DECISION CHAT
+                <span>AI DECISION CHAT</span>
+                {chatMessages.filter((m) => m.isError).length > 0 && (
+                  <span className="bg-red-500 text-white text-[9px] px-1.5 py-0.2 rounded-full font-bold animate-pulse">
+                    {chatMessages.filter((m) => m.isError).length}
+                  </span>
+                )}
               </button>
             </div>
 
@@ -718,7 +838,12 @@ print("BIM Scene loaded successfully in Blender.")`;
             )}
 
             {activeTab === "ai" && (
-              <AIChatPanel onSendMessage={handleSendMessage} />
+              <AIChatPanel
+                messages={chatMessages}
+                setMessages={setChatMessages}
+                onSendMessage={handleSendMessage}
+                onRetryStep={(stepId) => handleRunStep(stepId as PipelineStepId)}
+              />
             )}
 
             {activeTab === "validation" && (

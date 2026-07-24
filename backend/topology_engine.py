@@ -3,7 +3,8 @@ import json
 import logging
 import math
 import time
-from typing import List, Dict, Any, Tuple
+import hashlib
+from typing import List, Dict, Any, Tuple, Optional
 from collections import defaultdict
 
 from rtree import index
@@ -15,9 +16,10 @@ from backend.config import ConfigManager
 
 class TopologyEngine:
     """
-    Topology Engine (Step 3 of the KaRar Pipeline) - Production Ready.
-    Features: Fast O(N log N) T-Junction Resolution, X-Junction Resolution via unary_union,
-    Node and Edge Graph Extraction, Face (Closed Loop) Detection, Adjacency mapping.
+    Topology Engine (Step 3 of the KaRar Pipeline) - Production Ready & Deterministic.
+    Features: Fast O(N log N) T-Junction Resolution with interior segment parameter checks (0 < t < 1),
+    X-Junction Resolution via unary_union, Node and Edge Graph Extraction with angle-based L/Straight classification,
+    Face (Closed Loop) Detection, Adjacency mapping, SHA256 topology verification.
     """
     def __init__(self):
         self.path_manager = PathManager()
@@ -32,19 +34,28 @@ class TopologyEngine:
             "t_junctions_snapped": 0,
             "final_nodes": 0,
             "final_edges": 0,
+            "straight_nodes_count": 0,
+            "L_corner_nodes_count": 0,
+            "T_nodes_count": 0,
+            "X_nodes_count": 0,
             "closed_loops_found": 0,
-            "processing_time_ms": 0
+            "processing_time_ms": 0,
+            "topology_sha256": ""
         }
 
     def _distance(self, p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
         return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
-    def _project_pt_to_line(self, p: Tuple[float, float], a: Tuple[float, float], b: Tuple[float, float]) -> Tuple[float, float]:
+    def _project_pt_to_line(self, p: Tuple[float, float], a: Tuple[float, float], b: Tuple[float, float]) -> Tuple[Tuple[float, float], float, float]:
         dx, dy = b[0] - a[0], b[1] - a[1]
         l2 = dx*dx + dy*dy
-        if l2 == 0: return a
-        t = max(0, min(1, ((p[0]-a[0])*dx + (p[1]-a[1])*dy) / l2))
-        return (a[0] + t*dx, a[1] + t*dy)
+        if l2 < 1e-10:
+            return a, self._distance(p, a), 0.0
+        t = ((p[0]-a[0])*dx + (p[1]-a[1])*dy) / l2
+        t_clamped = max(0.0, min(1.0, t))
+        proj = (a[0] + t_clamped*dx, a[1] + t_clamped*dy)
+        d = self._distance(p, proj)
+        return proj, d, t
 
     def _calculate_angle(self, p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
         dx = p2[0] - p1[0]
@@ -54,10 +65,32 @@ class TopologyEngine:
             angle += 180.0
         return round(angle, 1)
 
-    def _determine_node_type(self, degree: int) -> str:
-        if degree <= 1: return "end"
-        if degree == 2: return "straight/L"
-        if degree == 3: return "T"
+    def _determine_node_type(self, node_id: int, deg: int, node_edges: List[Dict[str, Any]], node_coords: Tuple[float, float]) -> str:
+        if deg <= 1:
+            return "end"
+        if deg == 2 and len(node_edges) == 2:
+            # Distinguish straight continuation vs L-corner based on vector dot product
+            e1, e2 = node_edges[0], node_edges[1]
+            p1_other = (e1["to_x"], e1["to_y"]) if (e1["from_x"], e1["from_y"]) == node_coords else (e1["from_x"], e1["from_y"])
+            p2_other = (e2["to_x"], e2["to_y"]) if (e2["from_x"], e2["from_y"]) == node_coords else (e2["from_x"], e2["from_y"])
+            
+            v1_x, v1_y = p1_other[0] - node_coords[0], p1_other[1] - node_coords[1]
+            v2_x, v2_y = p2_other[0] - node_coords[0], p2_other[1] - node_coords[1]
+            len1, len2 = math.hypot(v1_x, v1_y), math.hypot(v2_x, v2_y)
+            if len1 > 1e-5 and len2 > 1e-5:
+                dot = (v1_x * v2_x + v1_y * v2_y) / (len1 * len2)
+                dot = max(-1.0, min(1.0, dot))
+                angle_deg = math.degrees(math.acos(dot))
+                # angle_deg near 180 means straight line continuation
+                if angle_deg > 165.0:
+                    self.stats["straight_nodes_count"] += 1
+                    return "straight"
+            self.stats["L_corner_nodes_count"] += 1
+            return "L_corner"
+        if deg == 3:
+            self.stats["T_nodes_count"] += 1
+            return "T"
+        self.stats["X_nodes_count"] += 1
         return "X"
 
     def run(self) -> Dict[str, Any]:
@@ -93,24 +126,23 @@ class TopologyEngine:
         for i, s in enumerate(segments):
             new_s = []
             for p in s:
-                min_dist = self.snap_tolerance
-                best_proj = None
-                
-                # Query R-Tree
+                # Query R-Tree for candidate lines
                 bbox = (p[0]-self.snap_tolerance, p[1]-self.snap_tolerance, 
                         p[0]+self.snap_tolerance, p[1]+self.snap_tolerance)
-                neighbors = list(rt.intersection(bbox))
+                raw_neighbors = list(rt.intersection(bbox))
                 
-                for j in neighbors:
+                # Deterministic candidate sorting
+                candidates = []
+                for j in raw_neighbors:
                     if i == j: continue
-                    proj = self._project_pt_to_line(p, segments[j][0], segments[j][1])
-                    d = self._distance(p, proj)
-                    # if > 1e-4 it means it's not perfectly touching already
-                    if 1e-4 < d < min_dist:
-                        min_dist = d
-                        best_proj = proj
+                    proj, d, t = self._project_pt_to_line(p, segments[j][0], segments[j][1])
+                    # Strictly interior projection: 0.001 < t < 0.999 prevents projection onto segment endpoints
+                    if 0.001 < t < 0.999 and 1e-4 < d < self.snap_tolerance:
+                        candidates.append((d, proj[0], proj[1], j, proj))
                         
-                if best_proj:
+                if candidates:
+                    candidates.sort(key=lambda c: (c[0], c[1], c[2], c[3]))
+                    _, _, _, _, best_proj = candidates[0]
                     new_s.append(best_proj)
                     self.stats["t_junctions_snapped"] += 1
                 else:
@@ -139,6 +171,7 @@ class TopologyEngine:
         node_coords = []
         node_map = {}
         node_degrees = defaultdict(int)
+        node_edges_map = defaultdict(list)
         
         edges = []
         
@@ -165,24 +198,33 @@ class TopologyEngine:
             length = self._distance(p0, p1)
             angle = self._calculate_angle(p0, p1)
             
-            edges.append({
+            edge_obj = {
                 "id": idx,
                 "from": n0,
                 "to": n1,
-                "length": length,
+                "from_x": p0[0],
+                "from_y": p0[1],
+                "to_x": p1[0],
+                "to_y": p1[1],
+                "length": round(length, 3),
                 "angle": angle
-            })
+            }
+            edges.append(edge_obj)
+            node_edges_map[n0].append(edge_obj)
+            node_edges_map[n1].append(edge_obj)
             
-        # Format Nodes
+        # Format Nodes with accurate degree & angular classification (L-corner vs Straight)
         nodes = []
         for i, coord in enumerate(node_coords):
             deg = node_degrees[i]
+            n_edges = node_edges_map[i]
+            node_type = self._determine_node_type(i, deg, n_edges, coord)
             nodes.append({
                 "id": i,
                 "x": coord[0],
                 "y": coord[1],
                 "degree": deg,
-                "type": self._determine_node_type(deg)
+                "type": node_type
             })
             
         self.stats["final_nodes"] = len(nodes)
@@ -219,25 +261,44 @@ class TopologyEngine:
                         
             loops.append({
                 "id": i,
-                "area": poly.area,
-                "edges": list(poly_edges),
-                "boundary": [{"x": p[0], "y": p[1]} for p in boundary_coords]
+                "area": round(poly.area, 2),
+                "edges": sorted(list(poly_edges)),
+                "boundary": [{"x": round(p[0], 3), "y": round(p[1], 3)} for p in boundary_coords]
             })
             
         self.stats["closed_loops_found"] = len(loops)
         self.stats["processing_time_ms"] = int((time.time() - start_time) * 1000)
         
+        # Sort nodes, edges, loops canonically for strict determinism
+        nodes.sort(key=lambda n: (n["x"], n["y"], n["id"]))
+        edges.sort(key=lambda e: (min(e["from"], e["to"]), max(e["from"], e["to"]), e["id"]))
+        loops.sort(key=lambda l: (l["area"], l["id"]))
+        
+        # Clean internal edge coordinates before output JSON
+        clean_edges = []
+        for e in edges:
+            clean_edges.append({
+                "id": e["id"],
+                "from": e["from"],
+                "to": e["to"],
+                "length": e["length"],
+                "angle": e["angle"]
+            })
+            
         graph_payload = {
             "nodes": nodes,
-            "edges": edges,
+            "edges": clean_edges,
             "loops": loops
         }
+        
+        output_bytes = json.dumps(graph_payload, indent=4, sort_keys=True).encode('utf-8')
+        self.stats["topology_sha256"] = hashlib.sha256(output_bytes).hexdigest()
         
         # Save output
         output_path = self.path_manager.get_path('outputs', 'geometry_graph.json')
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(graph_payload, f, indent=4)
+        with open(output_path, 'wb') as f:
+            f.write(output_bytes)
             
         self._generate_qa_report()
             
@@ -249,19 +310,24 @@ class TopologyEngine:
 
 **Tarih/Zaman:** {time.strftime('%Y-%m-%d %H:%M:%S')}
 **İşlem Süresi:** {self.stats['processing_time_ms']} ms
+**Topoloji SHA-256 Özeti:** `{self.stats['topology_sha256']}`
 
 ## İşlem Özeti (Benchmark)
 - **Başlangıç Duvar Çizgileri:** {self.stats['initial_segments']}
-- **Snapping ile Kapatılan T-Junctions:** {self.stats['t_junctions_snapped']}
+- **Snapping ile Kapatılan T-Junctions (Strict 0 < t < 1 Interior Projection):** {self.stats['t_junctions_snapped']}
 - **Çıkarılan Unik Düğümler (Nodes):** {self.stats['final_nodes']}
+  - Straight Continuations: {self.stats['straight_nodes_count']}
+  - L-Corners: {self.stats['L_corner_nodes_count']}
+  - T-Junction Nodes: {self.stats['T_nodes_count']}
+  - X-Junction Nodes: {self.stats['X_nodes_count']}
 - **Ayrıştırılan Kesişimsiz Kenarlar (Edges):** {self.stats['final_edges']}
 - **Oluşturulan Kapalı Alanlar (Loops/Faces):** {self.stats['closed_loops_found']}
 
-## Mimari Başarımlar
-- **R-Tree T-Junction Yakalama:** Önceden her noktayı her kenarla O(N²) kıyaslayan yapı, uzamsal indeksleme ile O(N log N) performansına çıkarıldı. Hatalı bükülmeleri önlemek için nokta iz düşüm (point projection) metodu kullanıldı.
-- **Kesişim (X-Junction) Çözümü:** Shapely `unary_union` ile poligonizasyon ve kesişim tespiti deterministik olarak tek adımda çözüldü. Bu, merkez hattı (centerline) ağının matematiksel olarak kopukluk içermediğini garanti eder.
-- **Closed Loop (Faces) Üretimi:** Graf teorisi üzerinden `polygonize` edilerek dış çerçevesi kapanan alanlar tespit edildi. İç mekanların (odalar) ve çevreleyen alanların %100 doğrulukla listelenmesi sağlandı.
-- **Topolojik Kararlılık:** Graf yapısındaki her bir edge ve node eşsizdir. Her döngü, kendisini oluşturan edge kimliklerini (ID) tutarak komşuluk ilişkisi (adjacency) çıkarmaya hazır hale getirilmiştir.
+## Mimari Başarımlar ve Determinizm
+- **R-Tree T-Junction Yakalama:** Iz düşüm parametresi `0 < t < 1` kontrolüyle uç noktalara hatalı yapışmalar önlenmiş, deterministik aday sıralaması ile T-kesişimler O(N log N) performansında çözülmüştür.
+- **Kesişim (X-Junction) Çözümü:** Shapely `unary_union` ile planarizing ve kesişim tespiti yapılmış, merkez hattı ağının tam planarizasyonu sağlanmıştır.
+- **Düğüm Tip Sınıflandırması:** Degree=2 düğümler incident vektörlerin açısal skaler çarpımı ile `straight` (düz devam) ve `L_corner` (L köşe) olarak hassasiyetle ayrıştırılmıştır.
+- **Closed Loop (Faces) Üretimi:** Graf teorisi üzerinden `polygonize` edilerek dış çerçevesi kapanan alanlar tespit edilmiş ve SHA-256 imzası ile kilitlenmiştir.
 
 Bu yapı, Semantic Engine (Step 4) aşamasının gerektirdiği mekansal sınır ve bağlantı grafını eksiksiz şekilde sağlar.
 """
