@@ -30,6 +30,7 @@ class DXFParser:
         self.max_x = float('-inf')
         self.max_y = float('-inf')
         self.sagitta = self.config.get("dxf.sagitta", 0.05) # discretization precision
+        self.skipped_entities = 0
 
     def _update_bounds(self, x: float, y: float):
         self.min_x = min(self.min_x, x)
@@ -37,7 +38,7 @@ class DXFParser:
         self.max_x = max(self.max_x, x)
         self.max_y = max(self.max_y, y)
 
-    def _process_entity(self, entity, block_name="default"):
+    def _process_entity(self, entity, block_name="default", scale_factor=1.0):
         """Recursively process entities, including nested block references (INSERT)"""
         dxftype = entity.dxftype()
         layer = entity.dxf.layer if hasattr(entity.dxf, 'layer') else "0"
@@ -46,27 +47,29 @@ class DXFParser:
             # ezdxf allows iterating through virtual entities with transformations applied
             try:
                 for v_entity in entity.virtual_entities():
-                    self._process_entity(v_entity, block_name=entity.dxf.name)
+                    self._process_entity(v_entity, block_name=entity.dxf.name, scale_factor=scale_factor)
             except Exception as e:
                 self.logger.warning(f"Error expanding block reference {entity.dxf.name}: {e}")
+                self.skipped_entities += 1
 
         elif dxftype == 'LINE':
             try:
-                start = entity.dxf.start
-                end = entity.dxf.end
+                sx, sy, sz = entity.dxf.start.x * scale_factor, entity.dxf.start.y * scale_factor, entity.dxf.start.z * scale_factor
+                ex, ey, ez = entity.dxf.end.x * scale_factor, entity.dxf.end.y * scale_factor, entity.dxf.end.z * scale_factor
                 
-                self._update_bounds(start.x, start.y)
-                self._update_bounds(end.x, end.y)
+                self._update_bounds(sx, sy)
+                self._update_bounds(ex, ey)
                 
                 self.entities.append({
                     "type": "LINE",
                     "layer": layer,
                     "block_name": block_name,
-                    "start": {"x": start.x, "y": start.y, "z": start.z},
-                    "end": {"x": end.x, "y": end.y, "z": end.z}
+                    "start": {"x": sx, "y": sy, "z": sz},
+                    "end": {"x": ex, "y": ey, "z": ez}
                 })
             except Exception as e:
                 self.logger.warning(f"Error processing LINE: {e}")
+                self.skipped_entities += 1
 
         elif dxftype in ['LWPOLYLINE', 'POLYLINE', 'ARC', 'CIRCLE', 'ELLIPSE', 'SPLINE']:
             try:
@@ -79,8 +82,9 @@ class DXFParser:
                 if len(vertices) >= 2:
                     out_verts = []
                     for v in vertices:
-                        self._update_bounds(v.x, v.y)
-                        out_verts.append({"x": v.x, "y": v.y, "z": v.z})
+                        vx, vy, vz = v.x * scale_factor, v.y * scale_factor, v.z * scale_factor
+                        self._update_bounds(vx, vy)
+                        out_verts.append({"x": vx, "y": vy, "z": vz})
                         
                     is_closed = False
                     if hasattr(entity, 'is_closed'):
@@ -97,25 +101,57 @@ class DXFParser:
                     })
             except Exception as e:
                 self.logger.warning(f"Error processing {dxftype}: {e}")
+                self.skipped_entities += 1
                 
         elif dxftype in ['TEXT', 'MTEXT']:
             try:
-                insert = entity.dxf.insert
+                ix, iy, iz = entity.dxf.insert.x * scale_factor, entity.dxf.insert.y * scale_factor, entity.dxf.insert.z * scale_factor
                 text_content = entity.plain_text() if hasattr(entity, 'plain_text') else entity.dxf.text
-                height = getattr(entity.dxf, 'height', 2.5)
+                height = getattr(entity.dxf, 'height', 2.5) * scale_factor
                 
-                self._update_bounds(insert.x, insert.y)
+                self._update_bounds(ix, iy)
                 
                 self.entities.append({
                     "type": dxftype,
                     "layer": layer,
                     "block_name": block_name,
-                    "position": {"x": insert.x, "y": insert.y, "z": insert.z},
+                    "position": {"x": ix, "y": iy, "z": iz},
                     "height": height,
                     "text": text_content
                 })
             except Exception as e:
-                pass
+                self.logger.warning(f"Error processing {dxftype} handle {getattr(entity.dxf, 'handle', '?')}: {e}")
+                self.skipped_entities += 1
+                
+        elif dxftype == 'HATCH':
+            try:
+                paths = []
+                try:
+                    from ezdxf.path import make_paths
+                    paths = list(make_paths(entity))
+                except ImportError:
+                    from ezdxf.path import make_path
+                    paths = [make_path(entity)]
+                
+                for p in paths:
+                    vertices = list(p.flattening(distance=self.sagitta))
+                    if len(vertices) >= 2:
+                        out_verts = []
+                        for v in vertices:
+                            vx, vy, vz = v.x * scale_factor, v.y * scale_factor, v.z * scale_factor
+                            self._update_bounds(vx, vy)
+                            out_verts.append({"x": vx, "y": vy, "z": vz})
+                        
+                        self.entities.append({
+                            "type": "LWPOLYLINE",
+                            "layer": layer,
+                            "block_name": block_name,
+                            "vertices": out_verts,
+                            "closed": True
+                        })
+            except Exception as e:
+                self.logger.warning(f"Unsupported or failed HATCH entity handle {getattr(entity.dxf, 'handle', '?')}: {e}")
+                self.skipped_entities += 1
 
     def parse(self, filename: str, block_filter: Any = None) -> Dict[str, Any]:
         """
@@ -202,32 +238,18 @@ class DXFParser:
         self.max_y = float('-inf')
 
         for entity in msp:
-            self._process_entity(entity)
+            self._process_entity(entity, scale_factor=scale_factor)
 
-        # Apply scale factor to all parsed entities for unit normalization
-        if scale_factor != 1.0:
-            for ent in self.entities:
-                if ent['type'] == 'LINE':
-                    ent['start']['x'] *= scale_factor
-                    ent['start']['y'] *= scale_factor
-                    ent['start']['z'] *= scale_factor
-                    ent['end']['x'] *= scale_factor
-                    ent['end']['y'] *= scale_factor
-                    ent['end']['z'] *= scale_factor
-                elif ent['type'] in ['LWPOLYLINE', 'POLYLINE']:
-                    for v in ent.get('vertices', []):
-                        v['x'] *= scale_factor
-                        v['y'] *= scale_factor
-                        v['z'] *= scale_factor
-                elif ent['type'] in ['TEXT', 'MTEXT']:
-                    ent['position']['x'] *= scale_factor
-                    ent['position']['y'] *= scale_factor
-                    ent['position']['z'] *= scale_factor
-                    ent['height'] *= scale_factor
-            self.logger.info(f"Applied unit scale factor {scale_factor} to {len(self.entities)} entities.")
+        self.logger.info(f"Applied unit scale factor {scale_factor} during processing.")
 
+        metadata = {
+            "promoted_block": None,
+            "promotion_reason": None,
+        }
+        
         # Handle block filter or smart block promotion
-        if len(self.entities) == 0 and hasattr(doc, 'blocks'):
+        enable_promotion = self.config.get("parser.block_promotion", True)
+        if len(self.entities) == 0 and hasattr(doc, 'blocks') and enable_promotion:
             promoted = False
             if block_filter:
                 self.logger.info(f"Block filter '{block_filter}' specified. Attempting to promote this block...")
@@ -244,8 +266,10 @@ class DXFParser:
                 if target_block:
                     self.logger.info(f"Promoting entities from filtered block '{target_block.name}' ({len(target_block)} entities) to modelspace.")
                     for entity in target_block:
-                        self._process_entity(entity, block_name=target_block.name)
+                        self._process_entity(entity, block_name=target_block.name, scale_factor=scale_factor)
                     promoted = True
+                    metadata["promoted_block"] = target_block.name
+                    metadata["promotion_reason"] = "filter_match"
                 else:
                     self.logger.warning(f"Specified block_filter '{block_filter}' not found in blocks.")
 
@@ -273,9 +297,28 @@ class DXFParser:
                     best_block = candidate_blocks[0]
                     self.logger.info(f"Promoting entities from selected block '{best_block.name}' (score={get_block_score(best_block)}, count={len(best_block)}) to modelspace.")
                     for entity in best_block:
-                        self._process_entity(entity, block_name=best_block.name)
+                        self._process_entity(entity, block_name=best_block.name, scale_factor=scale_factor)
+                    metadata["promoted_block"] = best_block.name
+                    metadata["promotion_reason"] = "heuristic_score"
 
         self.logger.info(f"Extracted {len(self.entities)} flat entities from DXF.")
+
+        # Deterministic sorting of entities
+        def get_entity_sort_key(e):
+            geom = ""
+            if e['type'] == 'LINE':
+                geom = f"{e['start']['x']:.4f},{e['start']['y']:.4f},{e['end']['x']:.4f},{e['end']['y']:.4f}"
+            elif e['type'] == 'LWPOLYLINE':
+                verts = e.get('vertices', [])
+                if verts:
+                    geom = f"{verts[0]['x']:.4f},{verts[0]['y']:.4f},{len(verts)}"
+            elif e['type'] in ['TEXT', 'MTEXT']:
+                pos = e.get('position', {})
+                geom = f"{pos.get('x', 0):.4f},{pos.get('y', 0):.4f},{e.get('text', '')}"
+            return (e['type'], e['layer'], e['block_name'], geom)
+            
+        self.entities.sort(key=get_entity_sort_key)
+        metadata["skipped_entities"] = self.skipped_entities
 
         output_payload = {
             "project": self.config.get("project.name", "KaRar Project"),
@@ -287,6 +330,7 @@ class DXFParser:
                 "max_x": self.max_x if self.max_x != float('-inf') else 0.0,
                 "max_y": self.max_y if self.max_y != float('-inf') else 0.0
             },
+            "metadata": metadata,
             "entities": self.entities
         }
 
@@ -294,7 +338,7 @@ class DXFParser:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
         with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(output_payload, f, indent=2, ensure_ascii=False)
+            json.dump(output_payload, f, indent=2, ensure_ascii=False, sort_keys=True)
 
         self.logger.info(f"Raw DXF payloads exported successfully to {self.path_manager.get_relative_path(output_path)}")
         return output_payload
