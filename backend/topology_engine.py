@@ -7,7 +7,7 @@ import hashlib
 from typing import List, Dict, Any, Tuple, Optional
 from collections import defaultdict
 
-from rtree import index
+from backend.spatial_index import index
 from shapely.geometry import LineString
 from shapely.ops import unary_union, polygonize
 
@@ -28,9 +28,14 @@ class TopologyEngine:
         
         # Pull snap tolerance from config, or default 5.0
         self.snap_tolerance = self.config.get("tolerances.snapping_distance_mm", 5.0)
-        
-        self.stats = {
+        self.min_segment_length = float(self.config.get("tolerances.min_segment_length_mm", 1.0))
+
+        self.stats = self._build_empty_stats()
+
+    def _build_empty_stats(self) -> Dict[str, Any]:
+        return {
             "initial_segments": 0,
+            "filtered_short_segments": 0,
             "t_junctions_snapped": 0,
             "final_nodes": 0,
             "final_edges": 0,
@@ -42,6 +47,9 @@ class TopologyEngine:
             "processing_time_ms": 0,
             "topology_sha256": ""
         }
+
+    def _reset_stats(self) -> None:
+        self.stats = self._build_empty_stats()
 
     def _distance(self, p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
         return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
@@ -63,7 +71,157 @@ class TopologyEngine:
         angle = math.degrees(math.atan2(dy, dx))
         if angle < 0:
             angle += 180.0
+        if angle >= 180.0:
+            angle -= 180.0
         return round(angle, 1)
+
+    def _canonicalize_closed_boundary(self, boundary: List[Dict[str, Any]]) -> List[Dict[str, float]]:
+        coords = [
+            (round(float(point["x"]), 3), round(float(point["y"]), 3))
+            for point in boundary
+        ]
+
+        if len(coords) >= 2 and coords[0] == coords[-1]:
+            coords = coords[:-1]
+
+        if not coords:
+            return []
+
+        def _rotate_from_smallest(seq: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+            smallest_index = min(range(len(seq)), key=lambda idx: seq[idx])
+            rotated = seq[smallest_index:] + seq[:smallest_index]
+            return rotated + [rotated[0]]
+
+        forward = _rotate_from_smallest(coords)
+        reverse = _rotate_from_smallest(list(reversed(coords)))
+        canonical = min(tuple(forward), tuple(reverse))
+        return [{"x": x, "y": y} for x, y in canonical]
+
+    def _canonicalize_graph(
+        self,
+        nodes: List[Dict[str, Any]],
+        edges: List[Dict[str, Any]],
+        loops: List[Dict[str, Any]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        sorted_nodes = sorted(nodes, key=lambda n: (n["x"], n["y"], n["id"]))
+        node_id_map = {node["id"]: idx for idx, node in enumerate(sorted_nodes)}
+
+        canonical_nodes = []
+        for idx, node in enumerate(sorted_nodes):
+            canonical_nodes.append({
+                "id": idx,
+                "x": node["x"],
+                "y": node["y"],
+                "degree": node["degree"],
+                "type": node["type"],
+            })
+
+        remapped_edges = []
+        for edge in edges:
+            from_id = node_id_map[edge["from"]]
+            to_id = node_id_map[edge["to"]]
+            if from_id > to_id:
+                from_id, to_id = to_id, from_id
+
+            remapped_edges.append({
+                "old_id": edge["id"],
+                "from": from_id,
+                "to": to_id,
+                "length": edge["length"],
+                "angle": self._calculate_angle(
+                    (canonical_nodes[from_id]["x"], canonical_nodes[from_id]["y"]),
+                    (canonical_nodes[to_id]["x"], canonical_nodes[to_id]["y"]),
+                ),
+            })
+
+        remapped_edges.sort(
+            key=lambda e: (e["from"], e["to"], e["length"], e["angle"], e["old_id"])
+        )
+        edge_id_map = {edge["old_id"]: idx for idx, edge in enumerate(remapped_edges)}
+
+        canonical_edges = []
+        for idx, edge in enumerate(remapped_edges):
+            canonical_edges.append({
+                "id": idx,
+                "from": edge["from"],
+                "to": edge["to"],
+                "length": edge["length"],
+                "angle": edge["angle"],
+            })
+
+        remapped_loops = []
+        for loop in loops:
+            remapped_loop_edge_ids = sorted(
+                edge_id_map[edge_id]
+                for edge_id in loop.get("edges", [])
+                if edge_id in edge_id_map
+            )
+            canonical_boundary = self._canonicalize_closed_boundary(loop.get("boundary", []))
+
+            remapped_loops.append({
+                "old_id": loop["id"],
+                "area": loop["area"],
+                "edges": remapped_loop_edge_ids,
+                "boundary": canonical_boundary,
+            })
+
+        remapped_loops.sort(
+            key=lambda loop: (
+                loop["area"],
+                tuple((point["x"], point["y"]) for point in loop["boundary"]),
+                tuple(loop["edges"]),
+                loop["old_id"],
+            )
+        )
+
+        canonical_loops = []
+        for idx, loop in enumerate(remapped_loops):
+            canonical_loops.append({
+                "id": idx,
+                "area": loop["area"],
+                "edges": loop["edges"],
+                "boundary": loop["boundary"],
+            })
+
+        return {
+            "nodes": canonical_nodes,
+            "edges": canonical_edges,
+            "loops": canonical_loops,
+        }
+
+    def _normalize_line_endpoints(self, line: LineString) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+        coords = list(line.coords)
+        if len(coords) < 2:
+            return None
+
+        if line.length < self.min_segment_length:
+            self.stats["filtered_short_segments"] += 1
+            return None
+
+        p0 = (round(coords[0][0], 3), round(coords[0][1], 3))
+        p1 = (round(coords[-1][0], 3), round(coords[-1][1], 3))
+
+        if p0 == p1:
+            return None
+
+        if self._distance(p0, p1) < self.min_segment_length:
+            self.stats["filtered_short_segments"] += 1
+            return None
+
+        return (p0, p1) if p0 <= p1 else (p1, p0)
+
+    def _filter_planar_lines(self, lines: List[LineString]) -> List[LineString]:
+        unique_lines: Dict[Tuple[Tuple[float, float], Tuple[float, float]], LineString] = {}
+
+        for line in lines:
+            normalized = self._normalize_line_endpoints(line)
+            if normalized is None:
+                continue
+
+            if normalized not in unique_lines:
+                unique_lines[normalized] = LineString([normalized[0], normalized[1]])
+
+        return [unique_lines[key] for key in sorted(unique_lines.keys())]
 
     def _determine_node_type(self, node_id: int, deg: int, node_edges: List[Dict[str, Any]], node_coords: Tuple[float, float]) -> str:
         if deg <= 1:
@@ -95,6 +253,7 @@ class TopologyEngine:
 
     def run(self) -> Dict[str, Any]:
         start_time = time.time()
+        self._reset_stats()
         
         walls_path = self.path_manager.get_path('outputs', 'walls_clean.json')
         if not os.path.exists(walls_path):
@@ -110,16 +269,22 @@ class TopologyEngine:
         # 1. Prepare segments & Spatial Index for T-Junction snap
         segments = []
         rt = index.Index()
-        for i, ent in enumerate(walls_data):
+        for ent in walls_data:
             pts = ent.get('points', [])
             if len(pts) >= 2:
                 p0 = (pts[0][0], pts[0][1])
                 p1 = (pts[1][0], pts[1][1])
+
+                if self._distance(p0, p1) < self.min_segment_length:
+                    self.stats["filtered_short_segments"] += 1
+                    continue
+
+                segment_idx = len(segments)
                 segments.append([p0, p1])
                 
                 minx, miny = min(p0[0], p1[0]), min(p0[1], p1[1])
                 maxx, maxy = max(p0[0], p1[0]), max(p0[1], p1[1])
-                rt.insert(i, (minx, miny, maxx, maxy))
+                rt.insert(segment_idx, (minx, miny, maxx, maxy))
                 
         # 2. T-Junction Snap Pass
         snapped_segments = []
@@ -164,6 +329,8 @@ class TopologyEngine:
             final_lines = [noded]
         else:
             final_lines = []
+
+        final_lines = self._filter_planar_lines(final_lines)
             
         self.logger.info(f"Noding complete. Found {len(final_lines)} planar edges.")
         
@@ -269,27 +436,7 @@ class TopologyEngine:
         self.stats["closed_loops_found"] = len(loops)
         self.stats["processing_time_ms"] = int((time.time() - start_time) * 1000)
         
-        # Sort nodes, edges, loops canonically for strict determinism
-        nodes.sort(key=lambda n: (n["x"], n["y"], n["id"]))
-        edges.sort(key=lambda e: (min(e["from"], e["to"]), max(e["from"], e["to"]), e["id"]))
-        loops.sort(key=lambda l: (l["area"], l["id"]))
-        
-        # Clean internal edge coordinates before output JSON
-        clean_edges = []
-        for e in edges:
-            clean_edges.append({
-                "id": e["id"],
-                "from": e["from"],
-                "to": e["to"],
-                "length": e["length"],
-                "angle": e["angle"]
-            })
-            
-        graph_payload = {
-            "nodes": nodes,
-            "edges": clean_edges,
-            "loops": loops
-        }
+        graph_payload = self._canonicalize_graph(nodes, edges, loops)
         
         output_bytes = json.dumps(graph_payload, indent=4, sort_keys=True).encode('utf-8')
         self.stats["topology_sha256"] = hashlib.sha256(output_bytes).hexdigest()
@@ -314,6 +461,7 @@ class TopologyEngine:
 
 ## İşlem Özeti (Benchmark)
 - **Başlangıç Duvar Çizgileri:** {self.stats['initial_segments']}
+- **Elenen Kısa/Degenerate Segmentler:** {self.stats['filtered_short_segments']} (min length < {self.min_segment_length}mm)
 - **Snapping ile Kapatılan T-Junctions (Strict 0 < t < 1 Interior Projection):** {self.stats['t_junctions_snapped']}
 - **Çıkarılan Unik Düğümler (Nodes):** {self.stats['final_nodes']}
   - Straight Continuations: {self.stats['straight_nodes_count']}
@@ -325,6 +473,7 @@ class TopologyEngine:
 
 ## Mimari Başarımlar ve Determinizm
 - **R-Tree T-Junction Yakalama:** Iz düşüm parametresi `0 < t < 1` kontrolüyle uç noktalara hatalı yapışmalar önlenmiş, deterministik aday sıralaması ile T-kesişimler O(N log N) performansında çözülmüştür.
+- **Kısa Segment Gürültü Filtresi:** `min_segment_length_mm` altında kalan kaynak ve unary-union sonrası mikro segmentler elenerek near-degenerate drafting noise'ın graf topolojisini kirletmesi önlenmiştir.
 - **Kesişim (X-Junction) Çözümü:** Shapely `unary_union` ile planarizing ve kesişim tespiti yapılmış, merkez hattı ağının tam planarizasyonu sağlanmıştır.
 - **Düğüm Tip Sınıflandırması:** Degree=2 düğümler incident vektörlerin açısal skaler çarpımı ile `straight` (düz devam) ve `L_corner` (L köşe) olarak hassasiyetle ayrıştırılmıştır.
 - **Closed Loop (Faces) Üretimi:** Graf teorisi üzerinden `polygonize` edilerek dış çerçevesi kapanan alanlar tespit edilmiş ve SHA-256 imzası ile kilitlenmiştir.

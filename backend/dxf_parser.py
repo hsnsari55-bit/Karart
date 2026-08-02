@@ -130,8 +130,8 @@ class DXFParser:
                     from ezdxf.path import make_paths
                     paths = list(make_paths(entity))
                 except ImportError:
-                    from ezdxf.path import make_path
-                    paths = [make_path(entity)]
+                    from ezdxf.path import make_path as make_single_path
+                    paths = [make_single_path(entity)]
                 
                 for p in paths:
                     vertices = list(p.flattening(distance=self.sagitta))
@@ -153,6 +153,12 @@ class DXFParser:
                 self.logger.warning(f"Unsupported or failed HATCH entity handle {getattr(entity.dxf, 'handle', '?')}: {e}")
                 self.skipped_entities += 1
 
+    def _modelspace_has_entities(self, doc) -> bool:
+        try:
+            return any(True for _ in doc.modelspace())
+        except Exception:
+            return False
+
     def parse(self, filename: str, block_filter: Any = None) -> Dict[str, Any]:
         """
         Parses the DXF file using ezdxf and writes to outputs/dxf_raw.json.
@@ -169,11 +175,13 @@ class DXFParser:
         self.logger.info(f"DXFParser reading (ezdxf): {filepath}")
 
         doc = None
+        smart_repair_attempted = False
         try:
             # First try standard read
             doc = ezdxf.readfile(filepath)
         except Exception as e:
             self.logger.warning(f"Standard DXF read failed: {e}. Attempting smart repair on truncated file...")
+            smart_repair_attempted = True
             try:
                 # Read original content as latin-1 to avoid decoding errors
                 with open(filepath, "r", encoding="latin-1") as f:
@@ -211,6 +219,16 @@ class DXFParser:
                     self.logger.error(f"Failed to read DXF file even with recover: {e3}")
                     return {"error": str(e3), "entities": []}
 
+        if smart_repair_attempted and doc is not None and not self._modelspace_has_entities(doc):
+            self.logger.warning(
+                "Smart repair produced an empty modelspace. Retrying recover mode on original DXF to avoid geometry loss..."
+            )
+            try:
+                from ezdxf import recover
+                doc, auditor = recover.readfile(filepath)
+            except Exception as e4:
+                self.logger.warning(f"Fallback recover on original after empty smart-repair result failed: {e4}")
+
         msp = doc.modelspace()
         
         # Determine unit scale factor from $INSUNITS header variable
@@ -236,6 +254,7 @@ class DXFParser:
         self.min_y = float('inf')
         self.max_x = float('-inf')
         self.max_y = float('-inf')
+        self.skipped_entities = 0
 
         for entity in msp:
             self._process_entity(entity, scale_factor=scale_factor)

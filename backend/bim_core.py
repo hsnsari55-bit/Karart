@@ -18,6 +18,59 @@ class BIMCoreEngine:
     def _distance(self, p1, p2):
         return math.hypot(p1[0]-p2[0], p1[1]-p2[1])
 
+    def _build_wall_reference_map(self, walls):
+        """Build deterministic legacy-to-canonical wall reference map."""
+        wall_ref_to_uuid = {}
+        for wall in walls:
+            wall_uuid = wall.get('uuid')
+            if not wall_uuid:
+                continue
+
+            for key in ('uuid', 'id', 'wall_id', 'element_id', 'edge_id'):
+                ref = wall.get(key)
+                if ref is None:
+                    continue
+                wall_ref_to_uuid[ref] = wall_uuid
+                wall_ref_to_uuid[str(ref)] = wall_uuid
+
+        return wall_ref_to_uuid
+
+    def _resolve_parent_wall_reference(self, opening, wall_ref_to_uuid):
+        """Resolve legacy opening wall references to canonical wall UUID."""
+        for key in ('parent_wall', 'host_wall_uuid', 'wall_id', 'nearest_wall_edge_id', 'edge_id'):
+            ref = opening.get(key)
+            if ref is None:
+                continue
+
+            resolved = wall_ref_to_uuid.get(ref)
+            if resolved is None:
+                resolved = wall_ref_to_uuid.get(str(ref))
+            if resolved:
+                return resolved
+
+            if key == 'parent_wall' and isinstance(ref, str):
+                return ref
+
+        return None
+
+    def _get_element_points(self, element):
+        points = element.get('points')
+        if points is not None:
+            return points
+        geometry = element.get('geometry', {})
+        if isinstance(geometry, dict):
+            return geometry.get('points', [])
+        return []
+
+    def _get_element_boundary(self, element):
+        boundary = element.get('boundary')
+        if boundary is not None:
+            return boundary
+        geometry = element.get('geometry', {})
+        if isinstance(geometry, dict):
+            return geometry.get('boundary', [])
+        return []
+
     def _dist_point_to_segment(self, p, v, w):
         l2 = self._distance(v, w)**2
         if l2 == 0: return self._distance(p, v)
@@ -65,7 +118,7 @@ class BIMCoreEngine:
         if len(wall_elements) == len(edges):
             for i, wall in enumerate(wall_elements):
                 if 'uuid' not in wall:
-                    seed = f"wall_{wall.get('points')}"
+                    seed = f"wall_{self._get_element_points(wall)}"
                     wall['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
                 edge_idx_to_wall_uuid[i] = wall['uuid']
         else:
@@ -73,14 +126,15 @@ class BIMCoreEngine:
                 p0 = (nodes[edge['from']]['x'], nodes[edge['from']]['y'])
                 p1 = (nodes[edge['to']]['x'], nodes[edge['to']]['y'])
                 for wall in wall_elements:
-                    if 'uuid' in wall: 
-                        edge_idx_to_wall_uuid[i] = wall['uuid']
+                    wall_points = self._get_element_points(wall)
+                    if len(wall_points) < 2:
                         continue
-                    wp0, wp1 = wall['points'][0], wall['points'][1]
+                    wp0, wp1 = wall_points[0], wall_points[1]
                     if (self._distance(p0, wp0) < 1.0 and self._distance(p1, wp1) < 1.0) or \
                        (self._distance(p0, wp1) < 1.0 and self._distance(p1, wp0) < 1.0):
-                        seed = f"wall_{wp0}_{wp1}"
-                        wall['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
+                        if 'uuid' not in wall:
+                            seed = f"wall_{wp0}_{wp1}"
+                            wall['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
                         edge_idx_to_wall_uuid[i] = wall['uuid']
                         break
 
@@ -88,7 +142,7 @@ class BIMCoreEngine:
         bim_idx_to_uuid = {}
         for i, el in enumerate(bim_elements):
             if 'uuid' not in el:
-                seed = f"{el.get('type')}_{el.get('points') or el.get('boundary') or i}"
+                seed = f"{el.get('type')}_{self._get_element_points(el) or self._get_element_boundary(el) or i}"
                 el['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
             bim_idx_to_uuid[i] = el['uuid']
             
@@ -97,6 +151,8 @@ class BIMCoreEngine:
             elif cat == 'Window': windows.append(el)
             elif cat == 'Column': columns.append(el)
             elif cat == 'Door': doors.append(el)
+
+        wall_ref_to_uuid = self._build_wall_reference_map(walls)
 
         # Map Spaces (preserve existing space uuid or compute deterministic uuid)
         for sp in spaces:
@@ -137,22 +193,34 @@ class BIMCoreEngine:
 
         # 3. Window/Door <-> Wall Relationships
         for el in windows + doors:
+            resolved_parent_wall = self._resolve_parent_wall_reference(el, wall_ref_to_uuid)
+            if resolved_parent_wall:
+                el['parent_wall'] = resolved_parent_wall
+
             pts = el.get('points', [])
-            if not pts: continue
-            c_x = (pts[0][0] + pts[1][0]) / 2.0
-            c_y = (pts[0][1] + pts[1][1]) / 2.0
-            pt = (c_x, c_y)
+            if not pts:
+                pts = self._get_element_points(el)
+            if len(pts) >= 2:
+                c_x = (pts[0][0] + pts[1][0]) / 2.0
+                c_y = (pts[0][1] + pts[1][1]) / 2.0
+                pt = (c_x, c_y)
+            else:
+                pt = None
             
-            closest_wall = None
-            min_dist = 9999.0
-            for w in walls:
-                wp0, wp1 = w['points'][0], w['points'][1]
-                d = self._dist_point_to_segment(pt, wp0, wp1)
-                if d < min_dist:
-                    min_dist = d
-                    closest_wall = w['uuid']
-            
-            if min_dist < 10.0 and closest_wall:
+            closest_wall = el.get('parent_wall')
+            min_dist = 0.0 if closest_wall else 9999.0
+            if pt is not None and not closest_wall:
+                for w in walls:
+                    wall_points = self._get_element_points(w)
+                    if len(wall_points) < 2:
+                        continue
+                    wp0, wp1 = wall_points[0], wall_points[1]
+                    d = self._dist_point_to_segment(pt, wp0, wp1)
+                    if d < min_dist:
+                        min_dist = d
+                        closest_wall = w['uuid']
+
+            if closest_wall and (el.get('parent_wall') or (pt is not None and min_dist < 10.0)):
                 el['parent_wall'] = closest_wall
                 w_spaces = wall_to_spaces[closest_wall]
                 for sp_uuid in w_spaces:
@@ -179,7 +247,7 @@ class BIMCoreEngine:
 
         # Deterministic sorting helper for BIM elements
         def _elem_sort_key(el):
-            pts = el.get('points') or el.get('boundary') or []
+            pts = self._get_element_points(el) or self._get_element_boundary(el) or []
             c_x, c_y = 0.0, 0.0
             if pts:
                 if isinstance(pts[0], list):

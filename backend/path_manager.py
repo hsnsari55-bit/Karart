@@ -2,6 +2,7 @@ import os
 import logging
 from typing import Optional
 
+
 class PathManager:
     """
     Central Path Manager for KaRar platform.
@@ -46,15 +47,35 @@ class PathManager:
     def _setup_logging(self):
         """Configures standard logging routing directly to logs/pipeline.log."""
         log_file = self.get_path('logs', 'pipeline.log')
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s [%(levelname)s] (%(filename)s:%(lineno)d) - %(message)s',
-            handlers=[
-                logging.FileHandler(log_file, encoding='utf-8'),
-                logging.StreamHandler()
-            ]
+        formatter = logging.Formatter(
+            '%(asctime)s [%(levelname)s] (%(filename)s:%(lineno)d) - %(message)s'
         )
+
         self.logger = logging.getLogger('KaRar')
+        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
+
+        has_file_handler = any(
+            isinstance(handler, logging.FileHandler)
+            and os.path.abspath(getattr(handler, 'baseFilename', '')) == os.path.abspath(log_file)
+            for handler in self.logger.handlers
+        )
+        has_stream_handler = any(
+            isinstance(handler, logging.StreamHandler)
+            and not isinstance(handler, logging.FileHandler)
+            for handler in self.logger.handlers
+        )
+
+        if not has_file_handler:
+            file_handler = logging.FileHandler(log_file, encoding='utf-8')
+            file_handler.setFormatter(formatter)
+            self.logger.addHandler(file_handler)
+
+        if not has_stream_handler:
+            stream_handler = logging.StreamHandler()
+            stream_handler.setFormatter(formatter)
+            self.logger.addHandler(stream_handler)
+
         self.logger.info("KaRar PathManager successfully initialized. Workspace root locked.")
 
     def get_path(self, dir_key: str, filename: Optional[str] = None) -> str:

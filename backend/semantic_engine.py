@@ -7,7 +7,7 @@ import time
 from typing import List, Dict, Any, Tuple
 from collections import defaultdict
 from shapely.geometry import LineString, Polygon, Point
-from rtree import index
+from backend.spatial_index import index
 
 from backend.path_manager import PathManager
 from backend.config import ConfigManager
@@ -41,6 +41,43 @@ class SemanticEngine:
         self.stats[etype] += 1
         return ent
 
+    def _build_geometry_contract_extra(self, geom: Dict[str, Any]) -> Dict[str, Any]:
+        """Promote nested geometry fields to top-level for downstream contract stability."""
+        extra = {}
+        if not isinstance(geom, dict):
+            return extra
+
+        for key in ("points", "boundary", "length", "area"):
+            if key in geom:
+                extra[key] = geom[key]
+        return extra
+
+    def _normalize_points_payload(self, pts: List[Tuple[float, float]]) -> List[List[float]]:
+        """Keep geometry payload JSON-stable by emitting coordinate arrays, not tuples."""
+        return [[float(x), float(y)] for x, y in pts]
+
+    def _get_representative_segment(self, pts: List[Tuple[float, float]]) -> Tuple[Tuple[float, float], Tuple[float, float], float]:
+        """Return the longest non-degenerate consecutive segment for orientation checks."""
+        best_pair = None
+        best_len = 0.0
+        for i in range(len(pts) - 1):
+            p0 = pts[i]
+            p1 = pts[i + 1]
+            seg_len = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+            if seg_len > best_len:
+                best_len = seg_len
+                best_pair = (p0, p1)
+
+        if best_pair is not None and best_len > 1e-6:
+            return best_pair[0], best_pair[1], best_len
+
+        if len(pts) >= 2:
+            p0, p1 = pts[0], pts[-1]
+            seg_len = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+            return p0, p1, seg_len
+
+        return (0.0, 0.0), (0.0, 0.0), 0.0
+
     def run(self) -> Dict[str, Any]:
         start_time = time.time()
         
@@ -73,17 +110,29 @@ class SemanticEngine:
                 # Based on geometry area, separate structural columns/shafts from livable spaces
                 if area < 5000: 
                     reason = f"Topological closed loop with small area ({area:.1f})"
+                    geom_payload = {"boundary": boundary, "area": area}
                     bim_elements.append(self._create_entity(
                         etype="Column",
-                        geom={"boundary": boundary, "area": area},
-                        confidence=0.90, reason=reason, extra={"bounded_by_edges": edges_in_loop}
+                        geom=geom_payload,
+                        confidence=0.90,
+                        reason=reason,
+                        extra={
+                            **self._build_geometry_contract_extra(geom_payload),
+                            "bounded_by_edges": edges_in_loop,
+                        }
                     ))
                 else:
                     reason = f"Topological closed loop bounded by {len(edges_in_loop)} walls"
+                    geom_payload = {"boundary": boundary, "area": area}
                     bim_elements.append(self._create_entity(
                         etype="Space",
-                        geom={"boundary": boundary, "area": area},
-                        confidence=0.95, reason=reason, extra={"bounded_by_edges": edges_in_loop}
+                        geom=geom_payload,
+                        confidence=0.95,
+                        reason=reason,
+                        extra={
+                            **self._build_geometry_contract_extra(geom_payload),
+                            "bounded_by_edges": edges_in_loop,
+                        }
                     ))
                 
         # 2. PROCESS WALLS FROM EDGES
@@ -119,10 +168,19 @@ class SemanticEngine:
             
             reason = f"Topological edge separating {len(loops_connected)} space(s). Continuity: {continuity}"
                 
+            geom_payload = {"points": [p0, p1], "length": edge.get('length', 0)}
             bim_elements.append(self._create_entity(
-                etype="Wall", geom={"points": [p0, p1], "length": edge.get('length', 0)},
-                confidence=confidence, reason=reason,
-                extra={"sub_type": sub_type, "edge_id": edge['id'], "connected_loops": loops_connected, "continuity": continuity}
+                etype="Wall",
+                geom=geom_payload,
+                confidence=confidence,
+                reason=reason,
+                extra={
+                    **self._build_geometry_contract_extra(geom_payload),
+                    "sub_type": sub_type,
+                    "edge_id": edge['id'],
+                    "connected_loops": loops_connected,
+                    "continuity": continuity,
+                }
             ))
             
             w = LineString([p0, p1])
@@ -135,6 +193,7 @@ class SemanticEngine:
         for ent in raw_entities:
             etype = ent.get('type')
             layer = ent.get('layer', '').lower()
+            source_entity_type = str(ent.get('source_entity_type', etype or '')).upper()
             
             pts = []
             if etype == 'LINE':
@@ -172,9 +231,17 @@ class SemanticEngine:
                         if layer_hint_col:
                             reason += " (Layer hint confirms)"
                             confidence = 0.95
+                        geom_payload = {"points": self._normalize_points_payload(pts), "area": area}
                         bim_elements.append(self._create_entity(
-                            etype="Column", geom={"points": pts, "area": area},
-                            confidence=confidence, reason=reason
+                            etype="Column",
+                            geom=geom_payload,
+                            confidence=confidence,
+                            reason=reason,
+                            extra={
+                                **self._build_geometry_contract_extra(geom_payload),
+                                "source_layer": ent.get('layer'),
+                                "source_block_name": ent.get('block_name', 'default'),
+                            }
                         ))
                         continue
                 except: pass
@@ -191,21 +258,24 @@ class SemanticEngine:
             min_dist = float('inf')
             parallel_to_wall = False
             perpendicular_to_wall = False
+            nearest_wall_edge_id = None
+            ref_p0, ref_p1, ref_len = self._get_representative_segment(pts)
             
             for i in neighbors:
                 w = wall_lines[i]
                 d = geom.distance(w)
                 if d < min_dist:
                     min_dist = d
+                    nearest_wall_edge_id = edges[i]['id'] if i < len(edges) else None
                     
                 # Check angles for parallelism/perpendicularity
-                if len(pts) == 2:
-                    dx1 = pts[1][0] - pts[0][0]
-                    dy1 = pts[1][1] - pts[0][1]
+                if ref_len > 0:
+                    dx1 = ref_p1[0] - ref_p0[0]
+                    dy1 = ref_p1[1] - ref_p0[1]
                     dx2 = w.coords[1][0] - w.coords[0][0]
                     dy2 = w.coords[1][1] - w.coords[0][1]
                     
-                    len1 = math.hypot(dx1, dy1)
+                    len1 = ref_len
                     len2 = math.hypot(dx2, dy2)
                     
                     if len1 > 0 and len2 > 0:
@@ -240,9 +310,23 @@ class SemanticEngine:
                         reason = "Parallel to wall, opening size. Ambiguous between Wall boundary and Window."
                         confidence = 0.50
                 else:
-                    target_type = "Unknown" 
-                    reason = "Adjacent to a wall but neither parallel nor perpendicular. Ambiguous."
-                    confidence = 0.50
+                    if source_entity_type in {"ARC", "CIRCLE", "ELLIPSE", "SPLINE"}:
+                        if layer_door:
+                            target_type = "Door"
+                            reason = "Curved geometry adjacent to a wall, confirmed by door layer."
+                            confidence = 0.80
+                        elif layer_win:
+                            target_type = "Window"
+                            reason = "Curved geometry adjacent to a wall, confirmed by window layer."
+                            confidence = 0.80
+                        else:
+                            target_type = "Unknown"
+                            reason = "Curved geometry adjacent to a wall but lacks deterministic door/window evidence."
+                            confidence = 0.45
+                    else:
+                        target_type = "Unknown" 
+                        reason = "Adjacent to a wall but neither parallel nor perpendicular. Ambiguous."
+                        confidence = 0.50
             elif min_dist < 50.0 and length > 400:
                 if parallel_to_wall:
                     target_type = "Unknown" 
@@ -268,9 +352,20 @@ class SemanticEngine:
                     reason += " -> Recovered via layer hint."
                     confidence = 0.60
 
+            geom_payload = {"points": self._normalize_points_payload(pts), "length": length}
             bim_elements.append(self._create_entity(
-                etype=target_type, geom={"points": pts, "length": length},
-                confidence=confidence, reason=reason
+                etype=target_type,
+                geom=geom_payload,
+                confidence=confidence,
+                reason=reason,
+                extra={
+                    **self._build_geometry_contract_extra(geom_payload),
+                    "source_layer": ent.get('layer'),
+                    "source_block_name": ent.get('block_name', 'default'),
+                    "source_entity_type": source_entity_type,
+                    "nearest_wall_edge_id": nearest_wall_edge_id,
+                    "nearest_wall_distance": round(min_dist, 3) if min_dist != float('inf') else None,
+                }
             ))
 
         self.stats["processing_time_ms"] = int((time.time() - start_time) * 1000)

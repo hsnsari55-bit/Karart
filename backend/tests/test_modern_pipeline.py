@@ -3,7 +3,10 @@ import sys
 import unittest
 import json
 import logging
+import tempfile
+import types
 from typing import Dict, Any
+import ezdxf
 
 # Ensure backend directory is in python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -12,6 +15,7 @@ from backend.path_manager import PathManager
 from backend.dxf_parser import DXFParser
 from backend.geometry_engine import GeometryEngine
 from backend.topology_engine import TopologyEngine
+from backend.topology_health_report import TopologyHealthReporter
 from backend.semantic_engine import SemanticEngine
 from backend.space_engine import SpaceEngine
 from backend.bim_core import BIMCoreEngine
@@ -24,23 +28,39 @@ class TestModernPipeline(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        """Initialize workspace and test outputs path"""
-        cls.path_manager = PathManager()
+        """Initialize logger only; each test uses an isolated temp workspace."""
         cls.logger = logging.getLogger("TestModernPipeline")
-        
-        # We will work on a clean test outputs space
-        cls.test_outputs = {
-            "dxf_raw": cls.path_manager.get_path("outputs", "dxf_raw.json"),
-            "walls_clean": cls.path_manager.get_path("outputs", "walls_clean.json"),
-            "geometry_graph": cls.path_manager.get_path("outputs", "geometry_graph.json"),
-            "bim_semantics": cls.path_manager.get_path("outputs", "bim_semantics.json"),
-            "spaces": cls.path_manager.get_path("outputs", "spaces.json"),
-            "bim_model": cls.path_manager.get_path("outputs", "bim_model.json"),
+
+    def setUp(self):
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self.temp_dir = self._temp_dir.name
+        self.outputs_dir = os.path.join(self.temp_dir, "outputs")
+        os.makedirs(self.outputs_dir, exist_ok=True)
+
+        self.path_manager = types.SimpleNamespace(
+            get_path=lambda *parts: os.path.join(self.temp_dir, *parts),
+            get_relative_path=lambda path: path,
+        )
+
+        self.test_outputs = {
+            "dxf_raw": self.path_manager.get_path("outputs", "dxf_raw.json"),
+            "walls_clean": self.path_manager.get_path("outputs", "walls_clean.json"),
+            "geometry_graph": self.path_manager.get_path("outputs", "geometry_graph.json"),
+            "bim_semantics": self.path_manager.get_path("outputs", "bim_semantics.json"),
+            "spaces": self.path_manager.get_path("outputs", "spaces.json"),
+            "bim_model": self.path_manager.get_path("outputs", "bim_model.json"),
         }
+
+    def tearDown(self):
+        self._temp_dir.cleanup()
+
+    def _bind_engine(self, engine):
+        engine.path_manager = self.path_manager
+        return engine
 
     def test_01_geometry_engine_collinear_merge(self):
         """Test GeometryEngine collinear walls merging capabilities"""
-        engine = GeometryEngine()
+        engine = self._bind_engine(GeometryEngine())
         
         # Define two collinear overlapping wall lines
         # Segment 1: (0, 0) to (5, 0)
@@ -86,7 +106,7 @@ class TestModernPipeline(unittest.TestCase):
 
     def test_02_topology_engine_network(self):
         """Test TopologyEngine node-edge graph extraction"""
-        engine = TopologyEngine()
+        engine = self._bind_engine(TopologyEngine())
         
         # Mock wall data representing a simple L-junction of walls:
         # Wall 1: (0, 0) to (10, 0)
@@ -122,9 +142,495 @@ class TestModernPipeline(unittest.TestCase):
         # Verify output file exists
         self.assertTrue(os.path.exists(self.test_outputs["geometry_graph"]))
 
+    def test_02b_closed_wall_polyline_drives_healthy_geometry_topology_health_chain(self):
+        """Closed wall polyline should produce a healthy loop across Geometry -> Topology -> Health."""
+        geometry_engine = self._bind_engine(GeometryEngine())
+        topology_engine = self._bind_engine(TopologyEngine())
+
+        dummy_raw_payload = {
+            "project": "Closed Loop Fixture",
+            "source_file": "closed_loop_fixture.dxf",
+            "bounding_box": {"min_x": 0.0, "min_y": 0.0, "max_x": 10.0, "max_y": 10.0},
+            "entities": [
+                {
+                    "type": "LWPOLYLINE",
+                    "layer": "duvar",
+                    "block_name": "default",
+                    "closed": True,
+                    "vertices": [
+                        {"x": 0.0, "y": 0.0},
+                        {"x": 10.0, "y": 0.0},
+                        {"x": 10.0, "y": 10.0},
+                        {"x": 0.0, "y": 10.0}
+                    ]
+                }
+            ]
+        }
+
+        with open(self.test_outputs["dxf_raw"], "w", encoding="utf-8") as f:
+            json.dump(dummy_raw_payload, f, indent=4)
+
+        clean_walls = geometry_engine.run()
+
+        self.assertEqual(len(clean_walls), 4)
+        self.assertTrue(os.path.exists(self.test_outputs["walls_clean"]))
+
+        with open(self.test_outputs["walls_clean"], "r", encoding="utf-8") as f:
+            persisted_clean_walls = json.load(f)
+
+        self.assertEqual(len(persisted_clean_walls), 4)
+
+        graph = topology_engine.run()
+
+        self.assertEqual(len(graph["nodes"]), 4)
+        self.assertEqual(len(graph["edges"]), 4)
+        self.assertEqual(len(graph["loops"]), 1)
+
+        reporter = TopologyHealthReporter(
+            report_output_path=self.path_manager.get_path("outputs", "topology_health_report.json")
+        )
+        report = reporter.generate(graph)
+
+        self.assertEqual(report["status"], "HEALTHY")
+        self.assertEqual(report["counts"], {"nodes": 4, "edges": 4, "loops": 1})
+        self.assertEqual(report["diagnostics"], [])
+        self.assertTrue(report["checks"]["has_loops"])
+        self.assertTrue(report["checks"]["closed_loops"])
+        self.assertTrue(report["checks"]["no_dangling_nodes"])
+        self.assertTrue(report["checks"]["degree_metadata_consistency"])
+
+    def test_02c_parser_backed_closed_loop_dxf_drives_healthy_geometry_topology_health_chain(self):
+        """Real DXF parse output should preserve a closed wall loop through Geometry -> Topology -> Health."""
+        fixtures_dir = os.path.join(self.temp_dir, "fixtures")
+        os.makedirs(fixtures_dir, exist_ok=True)
+        fixture_name = "closed_loop_fixture.dxf"
+        fixture_path = os.path.join(fixtures_dir, fixture_name)
+
+        doc = ezdxf.new(dxfversion="R2010")
+        doc.header["$INSUNITS"] = 4  # millimeters
+        msp = doc.modelspace()
+        msp.add_lwpolyline(
+            [(0, 0), (4000, 0), (4000, 3000), (0, 3000)],
+            close=True,
+            dxfattribs={"layer": "duvar"},
+        )
+        doc.saveas(fixture_path)
+
+        parser = DXFParser()
+        parser.path_manager = types.SimpleNamespace(
+            workspace_root=self.temp_dir,
+            get_path=self.path_manager.get_path,
+            get_relative_path=self.path_manager.get_relative_path,
+        )
+        geometry_engine = self._bind_engine(GeometryEngine())
+        topology_engine = self._bind_engine(TopologyEngine())
+
+        raw_payload = parser.parse(os.path.join("fixtures", fixture_name))
+
+        self.assertEqual(raw_payload["source_file"], os.path.join("fixtures", fixture_name))
+        self.assertEqual(len(raw_payload["entities"]), 1)
+        self.assertEqual(raw_payload["entities"][0]["type"], "LWPOLYLINE")
+        self.assertTrue(raw_payload["entities"][0]["closed"])
+        self.assertTrue(os.path.exists(self.test_outputs["dxf_raw"]))
+
+        clean_walls = geometry_engine.run()
+
+        self.assertEqual(len(clean_walls), 4)
+        self.assertTrue(os.path.exists(self.test_outputs["walls_clean"]))
+
+        graph = topology_engine.run()
+
+        self.assertEqual(len(graph["nodes"]), 4)
+        self.assertEqual(len(graph["edges"]), 4)
+        self.assertEqual(len(graph["loops"]), 1)
+
+        reporter = TopologyHealthReporter(
+            report_output_path=self.path_manager.get_path("outputs", "topology_health_report.json")
+        )
+        report = reporter.generate(graph)
+
+        self.assertEqual(report["status"], "HEALTHY")
+        self.assertEqual(report["counts"], {"nodes": 4, "edges": 4, "loops": 1})
+        self.assertEqual(report["diagnostics"], [])
+        self.assertTrue(report["checks"]["has_loops"])
+        self.assertTrue(report["checks"]["all_loops_closed"])
+        self.assertTrue(report["checks"]["closed_loops"])
+        self.assertTrue(report["checks"]["no_dangling_nodes"])
+
+    def test_02d_parser_reuse_keeps_closed_loop_pipeline_outputs_deterministic(self):
+        """Reusing the same parser instance should keep raw/geometry/topology/health outputs stable."""
+        fixtures_dir = os.path.join(self.temp_dir, "fixtures")
+        os.makedirs(fixtures_dir, exist_ok=True)
+        fixture_name = "closed_loop_fixture_reuse.dxf"
+        fixture_path = os.path.join(fixtures_dir, fixture_name)
+
+        doc = ezdxf.new(dxfversion="R2010")
+        doc.header["$INSUNITS"] = 4  # millimeters
+        msp = doc.modelspace()
+        msp.add_lwpolyline(
+            [(0, 0), (4000, 0), (4000, 3000), (0, 3000)],
+            close=True,
+            dxfattribs={"layer": "duvar"},
+        )
+        doc.saveas(fixture_path)
+
+        parser = DXFParser()
+        parser.path_manager = types.SimpleNamespace(
+            workspace_root=self.temp_dir,
+            get_path=self.path_manager.get_path,
+            get_relative_path=self.path_manager.get_relative_path,
+        )
+
+        def run_pipeline_once():
+            geometry_engine = self._bind_engine(GeometryEngine())
+            topology_engine = self._bind_engine(TopologyEngine())
+
+            raw_payload = parser.parse(os.path.join("fixtures", fixture_name))
+            with open(self.test_outputs["dxf_raw"], "r", encoding="utf-8") as f:
+                persisted_raw = json.load(f)
+
+            clean_walls = geometry_engine.run()
+            with open(self.test_outputs["walls_clean"], "r", encoding="utf-8") as f:
+                persisted_clean_walls = json.load(f)
+
+            graph = topology_engine.run()
+            with open(self.test_outputs["geometry_graph"], "r", encoding="utf-8") as f:
+                persisted_graph = json.load(f)
+
+            reporter = TopologyHealthReporter(
+                report_output_path=self.path_manager.get_path("outputs", "topology_health_report.json")
+            )
+            report = reporter.generate(graph)
+
+            return {
+                "raw_payload": raw_payload,
+                "persisted_raw": persisted_raw,
+                "clean_walls": clean_walls,
+                "persisted_clean_walls": persisted_clean_walls,
+                "graph": graph,
+                "persisted_graph": persisted_graph,
+                "report": report,
+            }
+
+        first_run = run_pipeline_once()
+        second_run = run_pipeline_once()
+
+        for run in (first_run, second_run):
+            self.assertEqual(run["raw_payload"]["source_file"], os.path.join("fixtures", fixture_name))
+            self.assertEqual(run["raw_payload"]["bounding_box"], {
+                "min_x": 0.0,
+                "min_y": 0.0,
+                "max_x": 4000.0,
+                "max_y": 3000.0,
+            })
+            self.assertEqual(len(run["raw_payload"]["entities"]), 1)
+            self.assertEqual(run["raw_payload"]["entities"][0]["type"], "LWPOLYLINE")
+            self.assertTrue(run["raw_payload"]["entities"][0]["closed"])
+            self.assertEqual(run["raw_payload"].get("promoted_block"), None)
+            self.assertEqual(run["raw_payload"].get("promotion_reason"), None)
+            self.assertEqual(len(run["clean_walls"]), 4)
+            self.assertEqual(len(run["graph"]["nodes"]), 4)
+            self.assertEqual(len(run["graph"]["edges"]), 4)
+            self.assertEqual(len(run["graph"]["loops"]), 1)
+            self.assertEqual(run["report"]["status"], "HEALTHY")
+            self.assertEqual(run["report"]["counts"], {"nodes": 4, "edges": 4, "loops": 1})
+            self.assertEqual(run["report"]["diagnostics"], [])
+            self.assertTrue(run["report"]["checks"]["has_loops"])
+            self.assertTrue(run["report"]["checks"]["all_loops_closed"])
+            self.assertTrue(run["report"]["checks"]["closed_loops"])
+            self.assertTrue(run["report"]["checks"]["no_dangling_nodes"])
+
+        self.assertEqual(first_run["raw_payload"], second_run["raw_payload"])
+        self.assertEqual(first_run["persisted_raw"], second_run["persisted_raw"])
+        self.assertEqual(first_run["clean_walls"], second_run["clean_walls"])
+        self.assertEqual(first_run["persisted_clean_walls"], second_run["persisted_clean_walls"])
+        self.assertEqual(first_run["graph"], second_run["graph"])
+        self.assertEqual(first_run["persisted_graph"], second_run["persisted_graph"])
+        self.assertEqual(first_run["report"], second_run["report"])
+
+    def test_02e_parser_reuse_keeps_truncated_recover_pipeline_outputs_deterministic(self):
+        """Reusing the same parser instance should keep truncated-DXF recover outputs stable through Topology health."""
+        fixtures_dir = os.path.join(self.temp_dir, "fixtures")
+        os.makedirs(fixtures_dir, exist_ok=True)
+        fixture_name = "truncated_recoverable_fixture_reuse.dxf"
+        fixture_path = os.path.join(fixtures_dir, fixture_name)
+
+        doc = ezdxf.new(dxfversion="R2010")
+        doc.header["$INSUNITS"] = 4  # millimeters
+        msp = doc.modelspace()
+        msp.add_line((0, 0), (100, 0), dxfattribs={"layer": "Walls"})
+        doc.saveas(fixture_path)
+
+        with open(fixture_path, "r", encoding="latin-1") as f:
+            content = f.read()
+
+        with open(fixture_path, "w", encoding="latin-1") as f:
+            f.write(content[:-40])
+
+        parser = DXFParser()
+        parser.path_manager = types.SimpleNamespace(
+            workspace_root=self.temp_dir,
+            get_path=self.path_manager.get_path,
+            get_relative_path=self.path_manager.get_relative_path,
+        )
+
+        def run_pipeline_once():
+            geometry_engine = self._bind_engine(GeometryEngine())
+            topology_engine = self._bind_engine(TopologyEngine())
+
+            raw_payload = parser.parse(os.path.join("fixtures", fixture_name))
+            with open(self.test_outputs["dxf_raw"], "r", encoding="utf-8") as f:
+                persisted_raw = json.load(f)
+
+            clean_walls = geometry_engine.run()
+            with open(self.test_outputs["walls_clean"], "r", encoding="utf-8") as f:
+                persisted_clean_walls = json.load(f)
+
+            graph = topology_engine.run()
+            with open(self.test_outputs["geometry_graph"], "r", encoding="utf-8") as f:
+                persisted_graph = json.load(f)
+
+            reporter = TopologyHealthReporter(
+                report_output_path=self.path_manager.get_path("outputs", "topology_health_report.json")
+            )
+            report = reporter.generate(graph)
+
+            return {
+                "raw_payload": raw_payload,
+                "persisted_raw": persisted_raw,
+                "clean_walls": clean_walls,
+                "persisted_clean_walls": persisted_clean_walls,
+                "graph": graph,
+                "persisted_graph": persisted_graph,
+                "report": report,
+            }
+
+        first_run = run_pipeline_once()
+        second_run = run_pipeline_once()
+
+        for run in (first_run, second_run):
+            self.assertEqual(run["raw_payload"]["source_file"], os.path.join("fixtures", fixture_name))
+            self.assertEqual(run["raw_payload"]["bounding_box"], {
+                "min_x": 0.0,
+                "min_y": 0.0,
+                "max_x": 100.0,
+                "max_y": 0.0,
+            })
+            self.assertEqual(run["raw_payload"]["metadata"]["promoted_block"], None)
+            self.assertEqual(run["raw_payload"]["metadata"]["promotion_reason"], None)
+            self.assertEqual(run["raw_payload"]["metadata"]["skipped_entities"], 0)
+            self.assertEqual(len(run["raw_payload"]["entities"]), 1)
+            self.assertEqual(run["raw_payload"]["entities"][0]["type"], "LINE")
+            self.assertEqual(len(run["clean_walls"]), 1)
+            self.assertEqual(len(run["graph"]["nodes"]), 2)
+            self.assertEqual(len(run["graph"]["edges"]), 1)
+            self.assertEqual(len(run["graph"]["loops"]), 0)
+            self.assertEqual(run["report"]["status"], "WARNING")
+            self.assertEqual(run["report"]["counts"], {"nodes": 2, "edges": 1, "loops": 0})
+            self.assertFalse(run["report"]["checks"]["has_loops"])
+            self.assertFalse(run["report"]["checks"]["no_dangling_nodes"])
+            self.assertTrue(run["report"]["checks"]["all_loops_closed"])
+            self.assertTrue(run["report"]["checks"]["closed_loops"])
+
+        self.assertEqual(first_run["raw_payload"], second_run["raw_payload"])
+        self.assertEqual(first_run["persisted_raw"], second_run["persisted_raw"])
+        self.assertEqual(first_run["clean_walls"], second_run["clean_walls"])
+        self.assertEqual(first_run["persisted_clean_walls"], second_run["persisted_clean_walls"])
+        self.assertEqual(first_run["graph"], second_run["graph"])
+        self.assertEqual(first_run["persisted_graph"], second_run["persisted_graph"])
+        self.assertEqual(first_run["report"], second_run["report"])
+
+    def test_02f_parser_reuse_keeps_semantic_space_bim_outputs_deterministic(self):
+        """Reusing the same parser instance should keep Semantic -> Space -> BIM Core outputs stable."""
+        fixtures_dir = os.path.join(self.temp_dir, "fixtures")
+        os.makedirs(fixtures_dir, exist_ok=True)
+        fixture_name = "closed_loop_semantic_space_bim_fixture.dxf"
+        fixture_path = os.path.join(fixtures_dir, fixture_name)
+
+        doc = ezdxf.new(dxfversion="R2010")
+        doc.header["$INSUNITS"] = 4  # millimeters
+        msp = doc.modelspace()
+        msp.add_lwpolyline(
+            [(0, 0), (4000, 0), (4000, 3000), (0, 3000)],
+            close=True,
+            dxfattribs={"layer": "duvar"},
+        )
+        msp.add_line((2000, 0), (2000, 120), dxfattribs={"layer": "kapı"})
+        doc.saveas(fixture_path)
+
+        parser = DXFParser()
+        parser.path_manager = types.SimpleNamespace(
+            workspace_root=self.temp_dir,
+            get_path=self.path_manager.get_path,
+            get_relative_path=self.path_manager.get_relative_path,
+        )
+
+        def normalize_semantics(payload):
+            normalized = json.loads(json.dumps(payload))
+            normalized.setdefault("stats", {})["processing_time_ms"] = 0
+            normalized["elements"].sort(key=lambda el: (el.get("type", ""), el.get("uuid", "")))
+            return normalized
+
+        def normalize_spaces(payload):
+            normalized = json.loads(json.dumps(payload))
+            normalized.setdefault("stats", {})["processing_time_ms"] = 0
+            normalized["spaces"].sort(key=lambda sp: sp.get("uuid", ""))
+            for sp in normalized["spaces"]:
+                sp["bounded_by_walls"] = sorted(sp.get("bounded_by_walls", []))
+            return normalized
+
+        def normalize_canonical_model(payload):
+            normalized = json.loads(json.dumps(payload))
+            provenance = normalized.setdefault("provenance", {})
+            provenance["generated_at"] = "<normalized>"
+            provenance["canonical_bim_sha256"] = "<normalized>"
+            input_hashes = provenance.setdefault("input_hashes", {})
+            input_hashes["bim_semantics_sha256"] = "<normalized>"
+            input_hashes["spaces_sha256"] = "<normalized>"
+            input_hashes["geometry_graph_sha256"] = "<normalized>"
+
+            for collection in ("spaces", "walls", "windows", "columns", "doors"):
+                normalized[collection].sort(key=lambda el: el.get("uuid", ""))
+
+            for sp in normalized["spaces"]:
+                sp["related_walls"] = sorted(sp.get("related_walls", []))
+                sp["related_windows"] = sorted(sp.get("related_windows", []))
+                sp["related_columns"] = sorted(sp.get("related_columns", []))
+                sp["related_doors"] = sorted(sp.get("related_doors", []))
+                sp["neighbors"] = sorted(sp.get("neighbors", []))
+
+            for wall in normalized["walls"]:
+                if "related_spaces" in wall:
+                    wall["related_spaces"] = sorted(wall["related_spaces"])
+
+            for column in normalized["columns"]:
+                if "parent_spaces" in column:
+                    column["parent_spaces"] = sorted(column["parent_spaces"])
+
+            return normalized
+
+        def run_pipeline_once():
+            geometry_engine = self._bind_engine(GeometryEngine())
+            topology_engine = self._bind_engine(TopologyEngine())
+            semantic_engine = self._bind_engine(SemanticEngine())
+            space_engine = self._bind_engine(SpaceEngine())
+            bim_core_engine = self._bind_engine(BIMCoreEngine())
+
+            raw_payload = parser.parse(os.path.join("fixtures", fixture_name))
+            clean_walls = geometry_engine.run()
+            graph = topology_engine.run()
+
+            semantics = semantic_engine.run()
+            with open(self.test_outputs["bim_semantics"], "r", encoding="utf-8") as f:
+                persisted_semantics = json.load(f)
+
+            spaces = space_engine.run()
+            with open(self.test_outputs["spaces"], "r", encoding="utf-8") as f:
+                persisted_spaces = json.load(f)
+
+            canonical_model = bim_core_engine.run()
+            with open(self.test_outputs["bim_model"], "r", encoding="utf-8") as f:
+                persisted_bim_model = json.load(f)
+
+            return {
+                "raw_payload": raw_payload,
+                "clean_walls": clean_walls,
+                "graph": graph,
+                "semantics": semantics,
+                "persisted_semantics": persisted_semantics,
+                "spaces": spaces,
+                "persisted_spaces": persisted_spaces,
+                "canonical_model": canonical_model,
+                "persisted_bim_model": persisted_bim_model,
+            }
+
+        first_run = run_pipeline_once()
+        second_run = run_pipeline_once()
+
+        for run in (first_run, second_run):
+            semantic_types = [el["type"] for el in run["semantics"]["elements"]]
+
+            self.assertEqual(run["raw_payload"]["source_file"], os.path.join("fixtures", fixture_name))
+            self.assertEqual(len(run["clean_walls"]), 4)
+            self.assertEqual(len(run["graph"]["nodes"]), 4)
+            self.assertEqual(len(run["graph"]["edges"]), 4)
+            self.assertEqual(len(run["graph"]["loops"]), 1)
+            self.assertEqual(semantic_types.count("Wall"), 4)
+            self.assertIn("Space", semantic_types)
+            self.assertIn("Door", semantic_types)
+            self.assertEqual(len(run["spaces"]["spaces"]), 1)
+            self.assertEqual(len(run["spaces"]["spaces"][0]["bounded_by_walls"]), 4)
+            self.assertEqual(len(run["canonical_model"]["spaces"]), 1)
+            self.assertEqual(len(run["canonical_model"]["walls"]), 4)
+            self.assertEqual(len(run["canonical_model"]["doors"]), 1)
+
+            door = run["canonical_model"]["doors"][0]
+            self.assertIsNotNone(door.get("parent_wall"))
+
+            self.assertEqual(
+                normalize_semantics(run["semantics"]),
+                normalize_semantics(run["persisted_semantics"]),
+            )
+            self.assertEqual(
+                normalize_spaces(run["spaces"]),
+                normalize_spaces(run["persisted_spaces"]),
+            )
+            self.assertEqual(
+                normalize_canonical_model(run["canonical_model"]),
+                normalize_canonical_model(run["persisted_bim_model"]),
+            )
+
+        self.assertEqual(
+            normalize_semantics(first_run["semantics"]),
+            normalize_semantics(second_run["semantics"]),
+        )
+        self.assertEqual(
+            normalize_semantics(first_run["persisted_semantics"]),
+            normalize_semantics(second_run["persisted_semantics"]),
+        )
+        self.assertEqual(
+            normalize_spaces(first_run["spaces"]),
+            normalize_spaces(second_run["spaces"]),
+        )
+        self.assertEqual(
+            normalize_spaces(first_run["persisted_spaces"]),
+            normalize_spaces(second_run["persisted_spaces"]),
+        )
+        self.assertEqual(
+            normalize_canonical_model(first_run["canonical_model"]),
+            normalize_canonical_model(second_run["canonical_model"]),
+        )
+        self.assertEqual(
+            normalize_canonical_model(first_run["persisted_bim_model"]),
+            normalize_canonical_model(second_run["persisted_bim_model"]),
+        )
+
     def test_03_semantic_classification(self):
         """Test SemanticEngine classification of WALLS, COLUMNS, DOORS, WINDOWS"""
-        engine = SemanticEngine()
+        engine = self._bind_engine(SemanticEngine())
+
+        mock_graph = {
+            "nodes": [
+                {"id": 0, "x": 0.0, "y": 0.0},
+                {"id": 1, "x": 10.0, "y": 0.0}
+            ],
+            "edges": [
+                {"id": 1, "from": 0, "to": 1}
+            ],
+            "loops": [
+                {
+                    "id": 10,
+                    "area": 100.0,
+                    "edges": [],
+                    "boundary": [
+                        {"x": 5.0, "y": 5.0},
+                        {"x": 15.0, "y": 5.0},
+                        {"x": 15.0, "y": 15.0},
+                        {"x": 5.0, "y": 15.0}
+                    ]
+                }
+            ]
+        }
         
         # Write dummy raw dxf with secondary elements
         dummy_raw_payload = {
@@ -159,6 +665,8 @@ class TestModernPipeline(unittest.TestCase):
                 }
             ]
         }
+        with open(self.test_outputs["geometry_graph"], "w", encoding="utf-8") as f:
+            json.dump(mock_graph, f, indent=4)
         with open(self.test_outputs["dxf_raw"], "w", encoding="utf-8") as f:
             json.dump(dummy_raw_payload, f, indent=4)
             
@@ -178,7 +686,7 @@ class TestModernPipeline(unittest.TestCase):
 
     def test_04_space_extraction(self):
         """Test SpaceEngine closed-loop room detection"""
-        engine = SpaceEngine()
+        engine = self._bind_engine(SpaceEngine())
         
         # Mock geometry graph representing a closed square room:
         # Node 0 (0,0), Node 1 (10,0), Node 2 (10,10), Node 3 (0,10)
@@ -227,7 +735,7 @@ class TestModernPipeline(unittest.TestCase):
 
     def test_05_bim_core_canonical_export(self):
         """Test BIMCoreEngine canonical BIM structure assembling"""
-        engine = BIMCoreEngine()
+        engine = self._bind_engine(BIMCoreEngine())
         
         # Setup mock inputs
         mock_semantics = {
@@ -261,6 +769,62 @@ class TestModernPipeline(unittest.TestCase):
         
         # Verify output exists
         self.assertTrue(os.path.exists(self.test_outputs["bim_model"]))
+
+    def test_06_bim_core_normalizes_legacy_opening_wall_id_to_parent_wall_uuid(self):
+        """Legacy opening wall refs should be normalized to canonical parent_wall UUID."""
+        engine = self._bind_engine(BIMCoreEngine())
+
+        mock_semantics = {
+            "elements": [
+                {
+                    "element_id": "wall_1",
+                    "wall_id": 101,
+                    "type": "Wall",
+                    "points": [[0.0, 0.0], [10.0, 0.0]],
+                    "thickness": 250.0
+                },
+                {
+                    "element_id": "door_1",
+                    "type": "Door",
+                    "points": [[2.0, 0.0], [3.0, 0.0]],
+                    "width": 900.0,
+                    "wall_id": 101
+                }
+            ]
+        }
+        mock_spaces = {
+            "spaces": [
+                {
+                    "space_id": "space_1",
+                    "name": "Salon",
+                    "area": 100.0,
+                    "boundary": [[0, 0], [10, 0], [10, 10], [0, 10]],
+                    "edge_indices": [0]
+                }
+            ]
+        }
+        mock_graph = {
+            "nodes": [{"id": 0, "x": 0.0, "y": 0.0}, {"id": 1, "x": 10.0, "y": 0.0}],
+            "edges": [{"id": 1, "from": 0, "to": 1}]
+        }
+
+        with open(self.test_outputs["bim_semantics"], "w", encoding="utf-8") as f:
+            json.dump(mock_semantics, f, indent=4)
+        with open(self.test_outputs["spaces"], "w", encoding="utf-8") as f:
+            json.dump(mock_spaces, f, indent=4)
+        with open(self.test_outputs["geometry_graph"], "w", encoding="utf-8") as f:
+            json.dump(mock_graph, f, indent=4)
+
+        canonical_model = engine.run()
+
+        self.assertEqual(len(canonical_model["walls"]), 1)
+        self.assertEqual(len(canonical_model["doors"]), 1)
+
+        wall_uuid = canonical_model["walls"][0]["uuid"]
+        door = canonical_model["doors"][0]
+
+        self.assertEqual(door["parent_wall"], wall_uuid)
+        self.assertIn(door["uuid"], canonical_model["spaces"][0]["related_doors"])
 
 if __name__ == '__main__':
     unittest.main()

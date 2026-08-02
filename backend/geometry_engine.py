@@ -6,7 +6,7 @@ import time
 import hashlib
 from typing import List, Dict, Any, Tuple
 from shapely.geometry import Polygon
-from rtree import index
+from backend.spatial_index import index
 
 from backend.path_manager import PathManager
 from backend.config import ConfigManager
