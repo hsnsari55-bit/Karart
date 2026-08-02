@@ -1,0 +1,39 @@
+{
+  "files": {
+    "bim_model.json": {
+      "sha256": "b2c596373586011f10be77f047454317129cb0b3c0c5ab0edf7c8bad090ee74b",
+      "size_bytes": 2802
+    },
+    "bim_semantics.json": {
+      "sha256": "055242345dfb1e1b1719fcba3951ffe8ca658dc78ed9ae342439b13c19e03256",
+      "size_bytes": 766
+    },
+    "dxf_raw.json": {
+      "sha256": "a25bbce27262fa7ccd6c55eb81364c3062816e9f367356a411c664f8eea44c05",
+      "size_bytes": 2848
+    },
+    "geometry_graph.json": {
+      "sha256": "2039f7e9fe88acd3e994439fe744ec52cd78b483f181ecf5831e6a95408df8e0",
+      "size_bytes": 475
+    },
+    "spaces.json": {
+      "sha256": "cd4c0fe69e86e7a9bd292965c4a985fb4530e84bf028162a480d04e0c839e7ec",
+      "size_bytes": 599
+    },
+    "walls_clean.json": {
+      "sha256": "10f5790084f7c6d960d0869f4eaeb6cf7c03a2f4b5caf79368af77601c9de887",
+      "size_bytes": 607
+    }
+  },
+  "manifest_name": "modern_pipeline_outputs",
+  "manifest_version": 1,
+  "normalization": {
+    "bim_model.json": [
+      "provenance.generated_at",
+      "provenance.canonical_bim_sha256",
+      "provenance.input_hashes.bim_semantics_sha256",
+      "provenance.input_hashes.spaces_sha256",
+      "provenance.input_hashes.geometry_graph_sha256"
+    ]
+  }
+}

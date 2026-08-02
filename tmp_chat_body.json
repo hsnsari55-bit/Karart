@@ -1,0 +1,6 @@
+{
+  "messages": [
+    { "role": "user", "content": "ping" }
+  ],
+  "max_completion_tokens": 1
+}

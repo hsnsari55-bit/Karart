@@ -8,7 +8,7 @@ from typing import List, Dict, Any, Tuple
 from collections import defaultdict
 from shapely.geometry import LineString, Polygon, Point
 from shapely.ops import unary_union, polygonize
-from rtree import index
+from backend.spatial_index import index
 
 from backend.path_manager import PathManager
 from backend.config import ConfigManager

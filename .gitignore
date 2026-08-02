@@ -9,3 +9,4 @@ dist/
 logs/
 outputs/
 .kaRar/
+.tmp.driveupload/

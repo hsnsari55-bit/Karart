@@ -1,0 +1,33 @@
+{
+  "bim": {
+    "column_count": 0,
+    "door_count": 1,
+    "space_count": 1,
+    "wall_count": 1,
+    "window_count": 0
+  },
+  "graph": {
+    "edge_count": 1,
+    "loop_count": 0,
+    "loop_area_list": [],
+    "total_loop_area": 0.0,
+    "node_count": 2
+  },
+  "metrics_version": 1,
+  "semantics": {
+    "element_count": 2,
+    "element_type_counts": {
+      "Door": 1,
+      "Wall": 1
+    }
+  },
+  "source": "modern_pipeline_outputs",
+  "spaces": {
+    "count": 1,
+    "total_area": 100.0
+  },
+  "walls": {
+    "count": 2,
+    "total_segment_length": 20.0
+  }
+}

@@ -16,10 +16,24 @@ from dxf_parser import DXFParser
 from geometry_engine import GeometryEngine
 from topology_engine import TopologyEngine
 from constraint_solver import ConstraintSolver
+from topology_health_report import TopologyHealthReporter
 from topology_validator import TopologyValidator
 from semantic_engine import SemanticEngine
 from space_engine import SpaceEngine
 from bim_core import BIMCoreEngine
+
+
+class TopologyHealthGateError(RuntimeError):
+    """Raised when topology diagnostics fall below the required health threshold."""
+
+
+TOPOLOGY_HEALTH_CHECK_ALIASES = {
+    "has_nodes": "non_empty_nodes",
+    "has_edges": "non_empty_edges",
+    "has_loops": "non_empty_loops",
+    "all_loops_closed": "closed_loops",
+    "no_tiny_loops": "no_tiny_sliver_faces",
+}
 
 def compute_sha256(data: Any) -> str:
     """Computes SHA-256 hash of canonically sorted JSON payload for strict determinism verification."""
@@ -70,6 +84,157 @@ class RegressionTester:
         self.semantic_engine = SemanticEngine()
         self.space_engine = SpaceEngine()
         self.bim_core_engine = BIMCoreEngine()
+
+    def _build_topology_validation_report_path(self, filename: str) -> str:
+        """Builds a per-project topology validation report path to avoid overwrites."""
+        safe_name = os.path.splitext(os.path.basename(filename))[0]
+        return self.path_manager.get_path("outputs", f"topology_validation_{safe_name}.json")
+
+    def _build_topology_health_report_path(self, filename: str) -> str:
+        """Builds a per-project topology health report path to avoid overwrites."""
+        safe_name = os.path.splitext(os.path.basename(filename))[0]
+        return self.path_manager.get_path("outputs", f"topology_health_{safe_name}.json")
+
+    def _load_topology_validation_summary(self, report_path: str) -> Dict[str, Any]:
+        """Loads a compact summary from the topology validation JSON report."""
+        if not os.path.exists(report_path):
+            return {"status": "MISSING", "checks_passed": 0, "checks_total": 0}
+
+        with open(report_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        checks = data.get("checks", {})
+        checks_total = len(checks)
+        checks_passed = sum(1 for value in checks.values() if value is True)
+
+        return {
+            "status": data.get("status", "UNKNOWN"),
+            "checks_passed": checks_passed,
+            "checks_total": checks_total,
+            "counts": data.get("counts", {}),
+        }
+
+    def _load_topology_health_summary(self, report_path: str) -> Dict[str, Any]:
+        """Loads a compact summary from the topology health JSON report."""
+        if not os.path.exists(report_path):
+            return {
+                "status": "MISSING",
+                "connected_components": 0,
+                "component_sizes": [],
+                "component_size_histogram": {},
+                "dangling_node_count": 0,
+                "dangling_node_component_indexes": [],
+                "self_loop_edge_count": 0,
+                "isolated_node_component_indexes": [],
+                "degree_metadata_consistency": False,
+                "degree_metadata_mismatch_count": 0,
+                "failed_checks": [],
+                "issues": [],
+                "diagnostics": [],
+                "diagnostic_codes": [],
+            }
+
+        with open(report_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        graph_metrics = data.get("graph_metrics", {})
+        raw_checks = data.get("checks", {})
+        checks = dict(raw_checks)
+        for source_name, alias_name in TOPOLOGY_HEALTH_CHECK_ALIASES.items():
+            if source_name in checks and alias_name not in checks:
+                checks[alias_name] = checks[source_name]
+        failed_checks = sorted(
+            check_name for check_name, passed in checks.items() if passed is False
+        )
+        issues = data.get("issues", [])
+        diagnostics = data.get("diagnostics", [])
+        diagnostic_codes = [
+            diagnostic.get("code")
+            for diagnostic in diagnostics
+            if isinstance(diagnostic, dict) and diagnostic.get("code")
+        ]
+
+        return {
+            "status": data.get("status", "UNKNOWN"),
+            "connected_components": graph_metrics.get("connected_components", 0),
+            "component_sizes": graph_metrics.get("component_sizes", []),
+            "component_size_histogram": graph_metrics.get("component_size_histogram", {}),
+            "dangling_node_count": graph_metrics.get("dangling_node_count", 0),
+            "dangling_node_component_indexes": graph_metrics.get(
+                "dangling_node_component_indexes", []
+            ),
+            "self_loop_edge_count": graph_metrics.get("self_loop_edge_count", 0),
+            "isolated_node_component_indexes": graph_metrics.get(
+                "isolated_node_component_indexes", []
+            ),
+            "degree_metadata_consistency": checks.get("degree_metadata_consistency", False),
+            "degree_metadata_mismatch_count": len(
+                graph_metrics.get("degree_metadata_mismatches", [])
+            ),
+            "failed_checks": failed_checks,
+            "issues": issues,
+            "diagnostics": diagnostics,
+            "diagnostic_codes": diagnostic_codes,
+            "counts": data.get("counts", {}),
+        }
+
+    def _evaluate_topology_health_gate(self, summary: Dict[str, Any]) -> Dict[str, Any]:
+        """Evaluates the regression blocking rule for topology health diagnostics."""
+        actual_status = summary.get("status", "UNKNOWN")
+        passed = actual_status == "HEALTHY"
+        return {
+            "required_status": "HEALTHY",
+            "actual_status": actual_status,
+            "passed": passed,
+        }
+
+    def _enforce_topology_health_gate(self, summary: Dict[str, Any]) -> Dict[str, Any]:
+        """Blocks the pipeline when topology health is not fully healthy."""
+        gate = self._evaluate_topology_health_gate(summary)
+        if gate["passed"]:
+            return gate
+
+        raise TopologyHealthGateError(
+            "Topology health gate failed: "
+            f"expected {gate['required_status']} but got {gate['actual_status']} "
+            f"(components={summary.get('connected_components', 0)}, "
+            f"component_sizes={summary.get('component_sizes', [])}, "
+            f"dangling={summary.get('dangling_node_count', 0)}, "
+            f"dangling_components={summary.get('dangling_node_component_indexes', [])}, "
+            f"isolated_components={summary.get('isolated_node_component_indexes', [])}, "
+            f"self_loops={summary.get('self_loop_edge_count', 0)}, "
+            f"degree_metadata_mismatches={summary.get('degree_metadata_mismatch_count', 0)}, "
+            f"failed_checks={summary.get('failed_checks', [])}, "
+            f"diagnostic_codes={summary.get('diagnostic_codes', [])})."
+        )
+
+    def _format_topology_validation_markdown_cell(self, project_report: Dict[str, Any]) -> str:
+        """Formats topology validation visibility for the Markdown validation matrix."""
+        constraint = project_report.get("steps", {}).get("constraint_solver", {})
+        summary = constraint.get("topology_validation_summary", {})
+        status = summary.get("status", "N/A")
+        if status == "PASS":
+            return f"✅ PASS ({summary.get('checks_passed', 0)}/{summary.get('checks_total', 0)})"
+        if status == "FAIL":
+            return f"❌ FAIL ({summary.get('checks_passed', 0)}/{summary.get('checks_total', 0)})"
+        return f"⚪ {status}"
+
+    def _format_topology_health_markdown_cell(self, project_report: Dict[str, Any]) -> str:
+        """Formats topology health visibility for the Markdown validation matrix."""
+        constraint = project_report.get("steps", {}).get("constraint_solver", {})
+        summary = constraint.get("topology_health_summary", {})
+        status = summary.get("status", "N/A")
+        components = summary.get("connected_components", 0)
+        dangling = summary.get("dangling_node_count", 0)
+        degree_mismatches = summary.get("degree_metadata_mismatch_count", 0)
+
+        if status == "HEALTHY":
+            return f"✅ HEALTHY ({components}c/{dangling}d/{degree_mismatches}dm)"
+        if status == "WARNING":
+            return f"⚠️ WARNING ({components}c/{dangling}d/{degree_mismatches}dm)"
+        if status == "CRITICAL":
+            return f"❌ CRITICAL ({components}c/{dangling}d/{degree_mismatches}dm)"
+        return f"⚪ {status}"
 
     def run_on_file(self, filepath: str) -> Dict[str, Any]:
         """Runs the entire end-to-end pipeline on a single DXF file and collects stats."""
@@ -162,10 +327,50 @@ class RegressionTester:
             # Step 3b: Constraint Solver & Topology Validator (Mandatory Blocking Gate)
             s_time = time.time()
             self.logger.info("  Step 3b: Constraint Solver & Topology Validator...")
-            resolved_graph = self.constraint_solver.run(graph)
-            self.topology_validator.validate(resolved_graph)
-            elapsed_constraint = int((time.time() - s_time) * 1000)
-            report["steps"]["constraint_solver"] = {"status": "SUCCESS", "time_ms": elapsed_constraint}
+            topology_health_report_path = self._build_topology_health_report_path(filename)
+            topology_validation_report_path = self._build_topology_validation_report_path(filename)
+            try:
+                resolved_graph = self.constraint_solver.run(graph)
+                topology_health_reporter = TopologyHealthReporter(report_output_path=topology_health_report_path)
+                topology_health_reporter.generate(resolved_graph)
+                topology_health_summary = self._load_topology_health_summary(topology_health_report_path)
+                topology_health_gate = self._evaluate_topology_health_gate(topology_health_summary)
+                topology_validator = TopologyValidator(report_output_path=topology_validation_report_path)
+                report["steps"]["constraint_solver"] = {
+                    "status": "SUCCESS",
+                    "time_ms": 0,
+                    "topology_health_report": self.path_manager.get_relative_path(topology_health_report_path),
+                    "topology_health_summary": topology_health_summary,
+                    "topology_health_gate": topology_health_gate,
+                }
+                self._enforce_topology_health_gate(topology_health_summary)
+                topology_validator.validate(resolved_graph)
+                topology_validation_summary = self._load_topology_validation_summary(topology_validation_report_path)
+                elapsed_constraint = int((time.time() - s_time) * 1000)
+                report["steps"]["constraint_solver"].update({
+                    "time_ms": elapsed_constraint,
+                    "topology_validation_report": self.path_manager.get_relative_path(topology_validation_report_path),
+                    "topology_validation_summary": topology_validation_summary,
+                })
+            except Exception:
+                elapsed_constraint = int((time.time() - s_time) * 1000)
+                constraint_step = report["steps"].setdefault("constraint_solver", {})
+                constraint_step["status"] = "FAILURE"
+                constraint_step["time_ms"] = elapsed_constraint
+                if topology_health_report_path:
+                    constraint_step.setdefault(
+                        "topology_health_report",
+                        self.path_manager.get_relative_path(topology_health_report_path),
+                    )
+                if topology_validation_report_path and os.path.exists(topology_validation_report_path):
+                    constraint_step["topology_validation_report"] = self.path_manager.get_relative_path(
+                        topology_validation_report_path
+                    )
+                    constraint_step["topology_validation_summary"] = self._load_topology_validation_summary(
+                        topology_validation_report_path
+                    )
+                report["error_step"] = "constraint_solver"
+                raise
             
             # Step 4: Semantic Classification
             s_time = time.time()
@@ -434,15 +639,16 @@ class RegressionTester:
             f"- **Toplam İşlem Süresi:** {stats['total_execution_time_ms'] / 1000:.3f} saniye",
             f"- **Proje Başına Ortalama Süre:** {stats['average_execution_time_ms']:.1f} ms",
             "\n## 4. Proje Bazlı Detaylı Doğrulama Tablosu (Validation Matrix)",
-            "| No | Proje Adı | Parser | Geometry | Topology | Semantic | Space | BIM | 3D | IFC | Durum | Süre (ms) |",
-            "|---|---|---|---|---|---|---|---|---|---|---|---|",
+            "| No | Proje Adı | Parser | Geometry | Topology | Topo Validation | Semantic | Space | BIM | 3D | IFC | Durum | Süre (ms) |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
         ]
         
         for idx, p in enumerate(stats["projects"], 1):
             m = p["metrics"]
             status_symbol = "✅ SUCCESS" if p["status"] == "SUCCESS" else "❌ FAILED"
+            topo_validation = self._format_topology_validation_markdown_cell(p)
             md_lines.append(
-                f"| {idx:02d} | `{p['file']}` | {m['parser_success']:.0f}% | {m['geometry_accuracy']:.0f}% | {m['topology_accuracy']:.0f}% | {m['semantic_accuracy']:.0f}% | {m['space_accuracy']:.0f}% | {m['bim_accuracy']:.0f}% | {m['3d_accuracy']:.0f}% | {m['ifc_accuracy']:.0f}% | **{status_symbol}** | {p['total_time_ms']} |"
+                f"| {idx:02d} | `{p['file']}` | {m['parser_success']:.0f}% | {m['geometry_accuracy']:.0f}% | {m['topology_accuracy']:.0f}% | {topo_validation} | {m['semantic_accuracy']:.0f}% | {m['space_accuracy']:.0f}% | {m['bim_accuracy']:.0f}% | {m['3d_accuracy']:.0f}% | {m['ifc_accuracy']:.0f}% | **{status_symbol}** | {p['total_time_ms']} |"
             )
             
         md_lines.extend([
@@ -455,6 +661,32 @@ class RegressionTester:
             c = p.get("counts", {})
             md_lines.append(
                 f"| {idx:02d} | `{p['file']}` | {c.get('walls', '-')} | {c.get('nodes', '-')} | {c.get('edges', '-')} | {c.get('rooms', '-')} |"
+            )
+
+        md_lines.extend([
+            "\n## 5b. Topology Validation Diagnostic Raporları",
+            "| No | Proje Adı | Diagnostic Status | Checks | Rapor Yolu |",
+            "|---|---|---|---|---|",
+        ])
+
+        for idx, p in enumerate(stats["projects"], 1):
+            constraint = p.get("steps", {}).get("constraint_solver", {})
+            summary = constraint.get("topology_validation_summary", {})
+            md_lines.append(
+                f"| {idx:02d} | `{p['file']}` | {summary.get('status', 'N/A')} | {summary.get('checks_passed', 0)}/{summary.get('checks_total', 0)} | `{constraint.get('topology_validation_report', '-')}` |"
+            )
+
+        md_lines.extend([
+            "\n## 5c. Topology Health Diagnostic Raporları",
+            "| No | Proje Adı | Health Status | Component | Dangling | Self-loop | Rapor Yolu |",
+            "|---|---|---|---|---|---|---|",
+        ])
+
+        for idx, p in enumerate(stats["projects"], 1):
+            constraint = p.get("steps", {}).get("constraint_solver", {})
+            summary = constraint.get("topology_health_summary", {})
+            md_lines.append(
+                f"| {idx:02d} | `{p['file']}` | {self._format_topology_health_markdown_cell(p)} | {summary.get('connected_components', 0)} | {summary.get('dangling_node_count', 0)} | {summary.get('self_loop_edge_count', 0)} | `{constraint.get('topology_health_report', '-')}` |"
             )
             
         md_lines.extend([
@@ -509,4 +741,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
 
