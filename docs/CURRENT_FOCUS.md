@@ -9,46 +9,40 @@ Bu dosya, oturumlar arasında **anlık önceliği kaybetmemek** ve ajanların/ka
 - Öncelik filtresi: çekirdek doğruluk / determinizm / sağlamlık / performans etkisi ölçülemeyen işler ertelenir
 
 ## 1. Aktif Hedef
-- Hedef modül: `backend/tests/test_modern_pipeline.py` içindeki parser-backed determinism regression yüzeyi; odak alanı `DXFParser -> GeometryEngine -> TopologyEngine -> SemanticEngine -> SpaceEngine -> BIMCoreEngine`
-- Hedef problem: Aynı `DXFParser` örneği tekrar kullanıldığında parser state sızıntısı büyük ölçüde kapatıldı ve bu kanıt Geometry/Topology/Health zincirine taşındı. Bu oturumda kapsam bir adım daha ileri götürülerek aynı parser örneğiyle üretilen **Semantic / Space / Canonical BIM Model** çıktılarının yapısal olarak deterministik kaldığı regression ile kilitlendi. Son kalan fark, `BIMCoreEngine` provenance alanlarındaki (`generated_at`, `canonical_bim_sha256`, `input_hashes.*`) run-bağımlı metadata idi; test normalizasyonu bu alanları bilinçli şekilde dışarıda bırakarak çekirdek Canonical BIM sözleşmesini kıyaslıyor.
-- Neden şimdi: Bu değişiklik doğrudan Canonical BIM Model determinizmini ölçülebilir biçimde güçlendiriyor. Geometry/Topology zinciri downstream modüllerin tek veri kaynağı olduğundan, parser-backed tekrar çağrı davranışının semantics/space/BIM core seviyesine kadar kanıtlanması P0 güvence katmanı için yüksek öncelikliydi. Ayrıca hedefli düzeltmenin geniş regresyon yüzeyinde yeni kırılma üretmediği de doğrulanmalıydı.
+- Hedef modül: `backend/run_regression_tests.py`, `backend/output_manifest.py`, `backend/output_metrics.py`, `datasets/golden_manifests/modern_pipeline_outputs.json`, `datasets/golden_manifests/modern_pipeline_metrics.json`
+- Hedef problem: Parser-backed determinism artık `DXFParser -> GeometryEngine -> TopologyEngine -> SemanticEngine -> SpaceEngine -> BIMCoreEngine` zincirinde regression ile yeşil. Aktif iş, regression runner ve golden manifest/metrics katmanında **çekirdek deterministik sözleşme** ile run-bağımlı provenance/ölçüm ve beklenen negatif senaryo log gürültüsü arasındaki sınırı daha netleştirmek. Bu oturumda özel olarak `TopologyHealthGateError` için traceback gürültüsü azaltıldı; amaç, gerçek Geometry/Topology/Canonical BIM sapmalarını görünür tutarken beklenen gate düşüşlerinin log sinyalini daha okunur hale getirmek.
+- Neden şimdi: Bu adım doğrudan Geometry/Topology/Canonical BIM güvence katmanını ölçülebilir biçimde sertleştiriyor. Regression runner, çekirdek pipeline'ın kapılayıcı gözlem katmanı olduğundan burada gerçek sözleşme ihlali ile beklenen negatif senaryo çıktılarının ayrıştırılması P0 için yüksek öncelikli.
 
 ## 2. Başarı Kriteri
-- Geçmesi gereken parser determinism testleri:
-  - `backend/tests/test_dxf_parser_engine.py::TestDXFParserEngine::test_parse_resets_skipped_entities_between_runs`
-  - `backend/tests/test_dxf_parser_engine.py::TestDXFParserEngine::test_parse_resets_entities_and_bounds_between_runs`
-  - `backend/tests/test_dxf_parser_engine.py::TestDXFParserEngine::test_parse_reuses_parser_without_leaking_block_promotion_metadata`
-  - `backend/tests/test_dxf_parser_engine.py::TestDXFParserEngine::test_parse_reuses_parser_without_leaking_hatch_output_between_runs`
-  - `backend/tests/test_dxf_parser_engine.py::TestDXFParserEngine::test_parse_reuses_parser_with_block_filter_on_nested_blocks`
-  - `backend/tests/test_dxf_parser_engine.py::TestDXFParserEngine::test_parse_reuses_parser_with_truncated_dxf_recover_fallback`
-  - `backend/tests/test_dxf_parser_engine.py::TestDXFParserEngine::test_parse_reuses_parser_with_truncated_nested_block_filter_recover_fallback`
-  - `backend/tests/test_dxf_parser_engine.py::TestDXFParserEngine::test_parse_reuses_parser_with_truncated_multi_candidate_heuristic_recover_fallback`
-- Geçmesi gereken pipeline determinism testleri:
+- Geçmesi gereken regression / golden sözleşme testleri:
+  - `backend/tests/test_output_manifest.py`
+  - `backend/tests/test_output_metrics.py`
+  - `backend/tests/test_regression_topology_report_path.py`
+- Korunması gereken determinism / entegrasyon testleri:
   - `backend/tests/test_modern_pipeline.py::TestModernPipeline::test_02d_parser_reuse_keeps_closed_loop_pipeline_outputs_deterministic`
   - `backend/tests/test_modern_pipeline.py::TestModernPipeline::test_02e_parser_reuse_keeps_truncated_recover_pipeline_outputs_deterministic`
   - `backend/tests/test_modern_pipeline.py::TestModernPipeline::test_02f_parser_reuse_keeps_semantic_space_bim_outputs_deterministic`
-- Beklenen deterministik davranış: Aynı parser örneğiyle art arda yapılan çağrılarda parser metadata'sı, promoted geometry, `dxf_raw`, `walls_clean`, `geometry_graph`, topology health çıktıları ve Semantic/Space/BIM Core çıktı sözleşmeleri yapısal olarak birebir aynı kalmalı. `BIMCoreEngine` provenance alanlarındaki run-bağımlı metadata (`generated_at`, `canonical_bim_sha256`, `input_hashes.*`) determinism testinde normalize edilerek çekirdek model yapısından ayrıştırılmalı.
+- Beklenen davranış: Golden manifest/metrics/topology-health katmanı, gerçekten bozuk Geometry/Topology/Canonical BIM çıktılarında kırmızıya düşmeli; negatif test senaryolarının beklenen `BAŞARISIZ` logları ise suite sonucunu bozmadığı sürece regression sinyali olarak yorumlanmamalı. Özellikle topology health gate tarafından bilinçli üretilen başarısızlıklar traceback seline dönüşmeden tek satırlık anlaşılır log olarak görünmeli. Run-bağımlı provenance/ölçüm gürültüsü ile çekirdek sözleşme farkı net ayrıştırılmalı.
 - Ölçülebilir çıktı:
-  - `python -m unittest backend.tests.test_modern_pipeline.TestModernPipeline.test_02f_parser_reuse_keeps_semantic_space_bim_outputs_deterministic backend.tests.test_modern_pipeline.TestModernPipeline.test_02d_parser_reuse_keeps_closed_loop_pipeline_outputs_deterministic backend.tests.test_modern_pipeline.TestModernPipeline.test_02e_parser_reuse_keeps_truncated_recover_pipeline_outputs_deterministic 2>&1` sonucu **Ran 3 tests ... OK** olmalı.
-  - `python -m unittest backend.tests.test_modern_pipeline backend.tests.test_topology_health_report backend.tests.test_topology_validator backend.tests.test_topology_engine_determinism backend.tests.test_regression_bim_core_opening_parent_wall backend.tests.test_output_manifest backend.tests.test_output_metrics backend.tests.test_regression_topology_report_path 2>&1` sonucu **Ran 82 tests ... OK** olmalı.
+  - `python -m unittest backend.tests.test_output_manifest backend.tests.test_output_metrics backend.tests.test_regression_topology_report_path 2>&1` sonucu **Ran 19 tests ... OK** olmalı.
+  - `python -m unittest backend.tests.test_modern_pipeline backend.tests.test_topology_health_report backend.tests.test_topology_validator backend.tests.test_topology_engine_determinism backend.tests.test_regression_bim_core_opening_parent_wall backend.tests.test_output_manifest backend.tests.test_output_metrics backend.tests.test_regression_topology_report_path 2>&1` sonucu **Ran 83 tests ... OK** olmalı.
 
 ## 3. Bu Oturumda Yapılan Son İş
-- Son değişiklik özeti: `backend/tests/test_modern_pipeline.py` içindeki `test_02f_parser_reuse_keeps_semantic_space_bim_outputs_deterministic` normalizasyonu genişletildi. `normalize_canonical_model(...)` artık `provenance.generated_at`, `provenance.canonical_bim_sha256` ve `provenance.input_hashes.*` alanlarını normalize ediyor; böylece `DXFParser -> Geometry -> Topology -> Semantic -> Space -> BIM Core` zincirinde yapısal determinism, run-bağımlı provenance gürültüsünden ayrıştırılarak doğrulanıyor.
-- Son dokunulan dosyalar: `backend/tests/test_modern_pipeline.py`, `docs/CURRENT_FOCUS.md`, `docs/LATEST_HANDOFF.md`
+- Son değişiklik özeti: `backend/run_regression_tests.py` içinde en dış `except Exception as e` bloğu güncellendi. Artık beklenen `TopologyHealthGateError` durumlarında logger `exc_info=True` ile tam traceback basmıyor; yalnız beklenmeyen istisnalarda traceback korunuyor. Böylece negatif topology-health gate senaryoları regression çıktısında tek satırlık, yüksek sinyalli hata mesajı üretiyor; beklenmeyen kırılmalarda ise teşhis derinliği kaybolmuyor.
+- Son dokunulan dosyalar: `backend/run_regression_tests.py`, `docs/CURRENT_FOCUS.md`, `docs/LATEST_HANDOFF.md`
 - Son doğrulama komutları:
-  - `python -m unittest backend.tests.test_modern_pipeline.TestModernPipeline.test_02f_parser_reuse_keeps_semantic_space_bim_outputs_deterministic backend.tests.test_modern_pipeline.TestModernPipeline.test_02d_parser_reuse_keeps_closed_loop_pipeline_outputs_deterministic backend.tests.test_modern_pipeline.TestModernPipeline.test_02e_parser_reuse_keeps_truncated_recover_pipeline_outputs_deterministic 2>&1`
-  - `python -m unittest backend.tests.test_modern_pipeline backend.tests.test_topology_health_report backend.tests.test_topology_validator backend.tests.test_topology_engine_determinism backend.tests.test_regression_bim_core_opening_parent_wall backend.tests.test_output_manifest backend.tests.test_output_metrics backend.tests.test_regression_topology_report_path 2>&1`
+  - `python -m unittest backend.tests.test_output_manifest backend.tests.test_output_metrics backend.tests.test_regression_topology_report_path 2>&1`
 - Son doğrulama sonucu:
-  - Hedefli determinism doğrulaması: **Ran 3 tests in 0.160s — OK**
-  - Genişletilmiş core regression yüzeyi: **Ran 82 tests in 0.439s — OK**
+  - Manifest / metrics / topology-report regression doğrulaması: **Ran 19 tests in 0.066s — OK**
+  - Beklenen topology health gate düşüşü artık traceback yerine tek satırlık net log ile gözlendi: `Pipeline failed on sample_plan.dxf: Topology health gate failed: expected HEALTHY but got WARNING ...`
+  - PowerShell sarmalayıcı stderr/log satırları nedeniyle üst seviyede `NativeCommandError` benzeri gürültü üretse de unittest özeti net olarak `OK` kapandı.
 
 ## 4. Hemen Sonraki Adım
-- İlk okunacak dosya: `backend/run_regression_tests.py`, `backend/output_manifest.py`, `backend/output_metrics.py`, `datasets/golden_manifests/modern_pipeline_outputs.json`, `datasets/golden_manifests/modern_pipeline_metrics.json`
+- İlk okunacak dosya: `backend/run_regression_tests.py`, `backend/output_manifest.py`, `backend/output_metrics.py`, `backend/tests/test_regression_topology_report_path.py`
 - İlk çalıştırılacak test/komut:
-  - `python -m unittest backend.tests.test_output_manifest backend.tests.test_output_metrics backend.tests.test_regression_topology_report_path 2>&1`
-  - ardından gerekli ise `python backend/run_regression_tests.py ...` ile temsilî örnekler üzerinde topology health gate / manifest / metrics davranışını izole et
-- Yapılacak minimal değişiklik: sonraki yüksek değerli iş, regression runner ve golden manifest katmanında deterministik sözleşme ile run-bağımlı provenance/ölçüm alanlarının sınırını netleştirmek. Amaç genel refactor değil; Geometry/Topology/Canonical BIM Model doğruluğunu etkileyen gerçek mismatch sinyallerini gürültüden ayırmak.
-- Not: Parser-backed pipeline determinism şu anda yeşil. Bundan sonraki iş, bunu golden output / metrics doğrulama katmanında daha temsilî fixture'larla sürdürmek olmalı.
+  - değişiklik sonrası daha geniş güvence istenirse `python -m unittest backend.tests.test_modern_pipeline backend.tests.test_topology_health_report backend.tests.test_topology_validator backend.tests.test_topology_engine_determinism backend.tests.test_regression_bim_core_opening_parent_wall backend.tests.test_output_manifest backend.tests.test_output_metrics backend.tests.test_regression_topology_report_path 2>&1`
+- Yapılacak minimal değişiklik: regression runner ve golden manifest/metrics katmanında deterministik çekirdek sözleşme ile run-bağımlı provenance/ölçüm alanlarının sınırını daha açık ve tekrar kullanılabilir hale getirmek; ayrıca beklenen negatif senaryo loglarını suite sonucundan görsel olarak daha iyi ayırmak. Amaç genel refactor değil; Geometry/Topology/Canonical BIM Model doğruluğunu etkileyen gerçek mismatch sinyallerini gürültüden ayırmak.
+- Not: Parser-backed pipeline determinism için önceki geniş regression tabanı yeşil durumda. Bu oturumdaki değişiklik logging/gözlemlenebilirlik odaklıdır; yeni runner değişikliklerinden sonra geniş suite yeniden koşturulmalıdır.
 
 ## 5. Yasak / Ertelenmiş Alanlar
 - Bu oturumda dokunulmayacak alanlar: Blender builder, IFC exporter, UI marketing/placeholder işleri
