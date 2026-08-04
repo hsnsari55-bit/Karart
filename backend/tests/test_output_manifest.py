@@ -87,4 +87,4 @@ class TestOutputManifest(unittest.TestCase):
             json.dump({"spaces": [{"uuid": "space-1", "area": 99.0}]}, handle, indent=2)
 
         with self.assertRaises(SystemExit):
-            verify_manifest(self.manifest_path, self.outputs_dir, self.files)
+            verify_manifest(self.manifest_path, self.outputs_dir, self.files, verbose=False)

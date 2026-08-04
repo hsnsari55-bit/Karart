@@ -103,7 +103,26 @@ def update_manifest(manifest_path: Path, outputs_dir: Path, files: List[str]) ->
         print(f"  - {file_name}: {info['sha256'][:12]} ({info['size_bytes']} bytes)")
 
 
-def verify_manifest(manifest_path: Path, outputs_dir: Path, files: List[str]) -> None:
+def _emit_manifest_verification_result(
+    mismatches: List[str], current_files: Dict[str, Dict[str, Any]], *, verbose: bool
+) -> None:
+    if not verbose:
+        return
+
+    if mismatches:
+        print("Manifest doğrulaması BAŞARISIZ")
+        for item in mismatches:
+            print(f"  - {item}")
+        return
+
+    print("Manifest doğrulaması başarılı")
+    for file_name, info in current_files.items():
+        print(f"  - {file_name}: {info['sha256'][:12]}")
+
+
+def verify_manifest(
+    manifest_path: Path, outputs_dir: Path, files: List[str], *, verbose: bool = True
+) -> None:
     if not manifest_path.exists():
         raise FileNotFoundError(
             f"Manifest bulunamadı: {manifest_path}. Önce update çalıştırın."
@@ -139,15 +158,10 @@ def verify_manifest(manifest_path: Path, outputs_dir: Path, files: List[str]) ->
     if extra_expected:
         mismatches.append(f"Manifestte beklenmeyen ek girdiler var: {', '.join(extra_expected)}")
 
-    if mismatches:
-        print("Manifest doğrulaması BAŞARISIZ")
-        for item in mismatches:
-            print(f"  - {item}")
-        raise SystemExit(1)
+    _emit_manifest_verification_result(mismatches, current_files, verbose=verbose)
 
-    print("Manifest doğrulaması başarılı")
-    for file_name, info in current_files.items():
-        print(f"  - {file_name}: {info['sha256'][:12]}")
+    if mismatches:
+        raise SystemExit(1)
 
 
 def parse_args() -> argparse.Namespace:

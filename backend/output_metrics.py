@@ -4,6 +4,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict
 
+from backend.topology_health_report import TopologyHealthReporter
+
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
@@ -42,6 +44,72 @@ def _loop_area_list(graph: dict[str, Any]) -> list[float]:
     return sorted(areas)
 
 
+def _failed_checks(checks: dict[str, Any]) -> list[str]:
+    if not isinstance(checks, dict):
+        return []
+    return sorted(str(name) for name, passed in checks.items() if not bool(passed))
+
+
+def _diagnostic_codes(diagnostics: Any) -> list[str]:
+    if not isinstance(diagnostics, list):
+        return []
+
+    codes = {
+        str(diagnostic.get("code"))
+        for diagnostic in diagnostics
+        if isinstance(diagnostic, dict) and diagnostic.get("code")
+    }
+    return sorted(codes)
+
+
+def _build_topology_health_metrics(graph: dict[str, Any]) -> Dict[str, Any]:
+    report = TopologyHealthReporter().build_report(graph)
+    counts = report.get("counts", {}) if isinstance(report, dict) else {}
+    graph_metrics = report.get("graph_metrics", {}) if isinstance(report, dict) else {}
+    loop_metrics = report.get("loop_metrics", {}) if isinstance(report, dict) else {}
+
+    return {
+        "status": str(report.get("status", "UNKNOWN")),
+        "failed_checks": _failed_checks(report.get("checks", {})),
+        "diagnostic_codes": _diagnostic_codes(report.get("diagnostics", [])),
+        "counts": {
+            "nodes": int(counts.get("nodes", 0)),
+            "edges": int(counts.get("edges", 0)),
+            "loops": int(counts.get("loops", 0)),
+        },
+        "graph_metrics": {
+            "connected_components": int(graph_metrics.get("connected_components", 0)),
+            "component_sizes": [
+                int(size) for size in graph_metrics.get("component_sizes", [])
+            ],
+            "dangling_node_count": int(graph_metrics.get("dangling_node_count", 0)),
+            "isolated_node_count": int(graph_metrics.get("isolated_node_count", 0)),
+            "self_loop_edge_count": int(graph_metrics.get("self_loop_edge_count", 0)),
+            "degree_metadata_mismatch_count": len(
+                graph_metrics.get("degree_metadata_mismatches", [])
+            ),
+        },
+        "loop_metrics": {
+            "closed_loop_count": int(loop_metrics.get("closed_loop_count", 0)),
+            "open_loop_count": int(loop_metrics.get("open_loop_count", 0)),
+            "invalid_loop_area_count": int(loop_metrics.get("invalid_loop_area_count", 0)),
+            "tiny_loop_count": int(loop_metrics.get("tiny_loop_count", 0)),
+            "invalid_loop_edge_reference_count": int(
+                loop_metrics.get("invalid_loop_edge_reference_count", 0)
+            ),
+            "missing_loop_edge_reference_count": int(
+                loop_metrics.get("missing_loop_edge_reference_count", 0)
+            ),
+            "insufficient_unique_loop_edge_count": int(
+                loop_metrics.get("insufficient_unique_loop_edge_count", 0)
+            ),
+            "face_edge_inconsistency_count": int(
+                loop_metrics.get("face_edge_inconsistency_count", 0)
+            ),
+        },
+    }
+
+
 def build_metrics(outputs_dir: Path) -> Dict[str, Any]:
     walls = _read_json(outputs_dir / "walls_clean.json")
     graph = _read_json(outputs_dir / "geometry_graph.json")
@@ -57,7 +125,7 @@ def build_metrics(outputs_dir: Path) -> Dict[str, Any]:
     loop_area_list = _loop_area_list(graph)
 
     return {
-        "metrics_version": 1,
+        "metrics_version": 2,
         "source": "modern_pipeline_outputs",
         "walls": {
             "count": len(walls),
@@ -88,6 +156,7 @@ def build_metrics(outputs_dir: Path) -> Dict[str, Any]:
             "column_count": len(bim_model.get("columns", [])),
             "space_count": len(bim_space_items),
         },
+        "topology_health": _build_topology_health_metrics(graph),
     }
 
 
@@ -102,7 +171,23 @@ def update_metrics(snapshot_path: Path, outputs_dir: Path) -> None:
     print(json.dumps(metrics, indent=2, ensure_ascii=False, sort_keys=True))
 
 
-def compare_metrics(snapshot_path: Path, outputs_dir: Path) -> None:
+def _emit_metrics_comparison_result(expected: Dict[str, Any], current: Dict[str, Any], *, verbose: bool) -> None:
+    if not verbose:
+        return
+
+    if expected != current:
+        print("Metrik doğrulaması BAŞARISIZ")
+        print("Beklenen:")
+        print(json.dumps(expected, indent=2, ensure_ascii=False, sort_keys=True))
+        print("Mevcut:")
+        print(json.dumps(current, indent=2, ensure_ascii=False, sort_keys=True))
+        return
+
+    print("Metrik doğrulaması başarılı")
+    print(json.dumps(current, indent=2, ensure_ascii=False, sort_keys=True))
+
+
+def compare_metrics(snapshot_path: Path, outputs_dir: Path, *, verbose: bool = True) -> None:
     if not snapshot_path.exists():
         raise FileNotFoundError(f"Metrik snapshot bulunamadı: {snapshot_path}. Önce update çalıştırın.")
 
@@ -110,16 +195,10 @@ def compare_metrics(snapshot_path: Path, outputs_dir: Path) -> None:
         expected = json.load(handle)
 
     current = build_metrics(outputs_dir)
-    if expected != current:
-        print("Metrik doğrulaması BAŞARISIZ")
-        print("Beklenen:")
-        print(json.dumps(expected, indent=2, ensure_ascii=False, sort_keys=True))
-        print("Mevcut:")
-        print(json.dumps(current, indent=2, ensure_ascii=False, sort_keys=True))
-        raise SystemExit(1)
+    _emit_metrics_comparison_result(expected, current, verbose=verbose)
 
-    print("Metrik doğrulaması başarılı")
-    print(json.dumps(current, indent=2, ensure_ascii=False, sort_keys=True))
+    if expected != current:
+        raise SystemExit(1)
 
 
 def parse_args() -> argparse.Namespace:
