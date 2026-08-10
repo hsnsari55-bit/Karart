@@ -33,14 +33,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install ezdxf shapely rtree numpy
 
-      - name: QG-5: Frontend Linter & Type Check
+      - name: "QG-5: Frontend Linter & Type Check"
         run: |
           npm run lint
 
-      - name: QG-1 & QG-3: Python Regression Tests & Domain Hash Check
+      - name: "QG-1 & QG-3: Python Regression Tests & Domain Hash Check"
         run: |
           PYTHONPATH=. python3 backend/run_regression_tests.py
 
-      - name: QG-4 & QG-8: Static Import Analysis & Architectural Compliance
+      - name: "QG-4 & QG-8: Static Import Analysis & Architectural Compliance"
         run: |
           python3 -c "import sys; print('Static import compliance check passed.')"
