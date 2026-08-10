@@ -8,12 +8,12 @@
   },
   "graph": {
     "edge_count": 1,
-    "loop_count": 0,
     "loop_area_list": [],
-    "total_loop_area": 0.0,
-    "node_count": 2
+    "loop_count": 0,
+    "node_count": 2,
+    "total_loop_area": 0
   },
-  "metrics_version": 1,
+  "metrics_version": 2,
   "semantics": {
     "element_count": 2,
     "element_type_counts": {
@@ -26,8 +26,45 @@
     "count": 1,
     "total_area": 100.0
   },
+  "topology_health": {
+    "counts": {
+      "edges": 1,
+      "loops": 0,
+      "nodes": 2
+    },
+    "diagnostic_codes": [
+      "DANGLING_NODES",
+      "ZERO_LOOPS"
+    ],
+    "failed_checks": [
+      "has_loops",
+      "no_dangling_nodes",
+      "non_empty_loops"
+    ],
+    "graph_metrics": {
+      "component_sizes": [
+        2
+      ],
+      "connected_components": 1,
+      "dangling_node_count": 2,
+      "degree_metadata_mismatch_count": 0,
+      "isolated_node_count": 0,
+      "self_loop_edge_count": 0
+    },
+    "loop_metrics": {
+      "closed_loop_count": 0,
+      "face_edge_inconsistency_count": 0,
+      "insufficient_unique_loop_edge_count": 0,
+      "invalid_loop_area_count": 0,
+      "invalid_loop_edge_reference_count": 0,
+      "missing_loop_edge_reference_count": 0,
+      "open_loop_count": 0,
+      "tiny_loop_count": 0
+    },
+    "status": "WARNING"
+  },
   "walls": {
     "count": 2,
-    "total_segment_length": 20.0
+    "total_segment_length": 24.142136
   }
 }

@@ -403,7 +403,11 @@ class RegressionTester:
         except Exception as e:
             report["status"] = "FAILURE"
             report["error_msg"] = str(e)
-            self.logger.error(f"  Pipeline failed on {filepath}: {e}", exc_info=True)
+            log_with_traceback = not isinstance(e, TopologyHealthGateError)
+            self.logger.error(
+                f"  Pipeline failed on {filepath}: {e}",
+                exc_info=log_with_traceback,
+            )
             
         report["total_time_ms"] = int((time.time() - start_time) * 1000)
         return report

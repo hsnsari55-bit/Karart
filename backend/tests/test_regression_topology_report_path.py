@@ -485,8 +485,8 @@ class TestRegressionTopologyReportPath(unittest.TestCase):
             with metrics_path.open("w", encoding="utf-8") as handle:
                 json.dump(build_metrics(outputs_dir), handle, indent=2)
 
-            verify_manifest(manifest_path, outputs_dir, files)
-            compare_metrics(metrics_path, outputs_dir)
+            verify_manifest(manifest_path, outputs_dir, files, verbose=False)
+            compare_metrics(metrics_path, outputs_dir, verbose=False)
 
             health_report_path = base / "topology_health_sample_plan.json"
             with health_report_path.open("w", encoding="utf-8") as handle:
