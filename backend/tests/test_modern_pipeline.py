@@ -199,6 +199,66 @@ class TestModernPipeline(unittest.TestCase):
         self.assertTrue(report["checks"]["no_dangling_nodes"])
         self.assertTrue(report["checks"]["degree_metadata_consistency"])
 
+    def test_02ba_polyline_vertices_contract_keeps_geometry_output_deterministic_across_entity_permutations(self):
+        """Equivalent LWPOLYLINE vertex payload permutations should keep Geometry output identical."""
+
+        def run_geometry_once(entities):
+            geometry_engine = self._bind_engine(GeometryEngine())
+            raw_payload = {
+                "project": "Polyline Contract Fixture",
+                "source_file": "polyline_contract_fixture.dxf",
+                "bounding_box": {"min_x": 0.0, "min_y": 0.0, "max_x": 10.0, "max_y": 1.0},
+                "entities": entities,
+            }
+
+            with open(self.test_outputs["dxf_raw"], "w", encoding="utf-8") as f:
+                json.dump(raw_payload, f, indent=4)
+
+            clean_walls = geometry_engine.run()
+
+            with open(self.test_outputs["walls_clean"], "r", encoding="utf-8") as f:
+                persisted_clean_walls = json.load(f)
+
+            return {
+                "clean_walls": clean_walls,
+                "persisted_clean_walls": persisted_clean_walls,
+                "geometry_sha256": geometry_engine.stats["geometry_sha256"],
+            }
+
+        left_to_right = {
+            "type": "LWPOLYLINE",
+            "layer": "duvar",
+            "block_name": "default",
+            "closed": False,
+            "vertices": [
+                {"x": 0.0, "y": 0.0},
+                {"x": 5.0, "y": 0.0},
+            ],
+        }
+        right_to_left = {
+            "type": "LWPOLYLINE",
+            "layer": "duvar",
+            "block_name": "default",
+            "closed": False,
+            "vertices": [
+                {"x": 10.0, "y": 0.0},
+                {"x": 5.0, "y": 0.0},
+            ],
+        }
+
+        first_run = run_geometry_once([left_to_right, right_to_left])
+        second_run = run_geometry_once([right_to_left, left_to_right])
+
+        self.assertEqual(len(first_run["clean_walls"]), 1)
+        self.assertEqual(len(second_run["clean_walls"]), 1)
+        self.assertEqual(first_run["clean_walls"], second_run["clean_walls"])
+        self.assertEqual(first_run["persisted_clean_walls"], second_run["persisted_clean_walls"])
+        self.assertEqual(
+            first_run["clean_walls"][0]["points"],
+            second_run["clean_walls"][0]["points"],
+        )
+        self.assertEqual(first_run["geometry_sha256"], second_run["geometry_sha256"])
+
     def test_02c_parser_backed_closed_loop_dxf_drives_healthy_geometry_topology_health_chain(self):
         """Real DXF parse output should preserve a closed wall loop through Geometry -> Topology -> Health."""
         fixtures_dir = os.path.join(self.temp_dir, "fixtures")

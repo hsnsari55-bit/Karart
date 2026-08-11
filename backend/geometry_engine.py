@@ -264,7 +264,10 @@ class GeometryEngine:
                 pts = sorted([p0, p1])
                 return (layer, bname, etype, pts[0], pts[1])
             elif etype in ['LWPOLYLINE', 'POLYLINE']:
-                pts = [(round(p.get('x', 0), 2), round(p.get('y', 0), 2)) for p in ent.get('points', [])]
+                pts = [
+                    (round(p.get('x', 0), 2), round(p.get('y', 0), 2))
+                    for p in ent.get('vertices', ent.get('points', []))
+                ]
                 first_pt = pts[0] if pts else (0, 0)
                 return (layer, bname, etype, first_pt)
             return (layer, bname, etype, (0, 0))
