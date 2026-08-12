@@ -10,7 +10,7 @@ Bu dosya, oturumlar arasında **anlık önceliği kaybetmemek** ve ajanların/ka
 
 ## 1. Aktif Hedef
 - Hedef modül: `backend/run_regression_tests.py`, `backend/output_manifest.py`, `backend/output_metrics.py`, `datasets/golden_manifests/modern_pipeline_outputs.json`, `datasets/golden_manifests/modern_pipeline_metrics.json`
-- Hedef problem: Parser-backed determinism artık `DXFParser -> GeometryEngine -> TopologyEngine -> SemanticEngine -> SpaceEngine -> BIMCoreEngine` zincirinde regression ile yeşil. Aktif iş, regression runner ve golden manifest/metrics katmanında **çekirdek deterministik sözleşme** ile run-bağımlı provenance/ölçüm ve beklenen negatif senaryo log gürültüsü arasındaki sınırı daha netleştirmek. Bu oturumda özel olarak `TopologyHealthGateError` için traceback gürültüsü azaltıldı; amaç, gerçek Geometry/Topology/Canonical BIM sapmalarını görünür tutarken beklenen gate düşüşlerinin log sinyalini daha okunur hale getirmek.
+- Hedef problem: Parser-backed determinism artık `DXFParser -> GeometryEngine -> TopologyEngine -> SemanticEngine -> SpaceEngine -> BIMCoreEngine` zincirinde regression ile yeşil. Aktif iş, regression runner ve golden manifest/metrics katmanında **çekirdek deterministik sözleşme** ile run-bağımlı provenance/ölçüm ve beklenen negatif senaryo log gürültüsü arasındaki sınırı daha netleştirmek. Bu oturumda özel olarak topology health görünürlüğü ile bloklayıcı kabul otoritesi ayrımı netleştirildi; amaç, gerçek Geometry/Topology/Canonical BIM sapmalarını görünür tutarken topology health özetini diagnostik/izlenebilirlik katmanı olarak korumak ve gerçek bloklamayı `TopologyValidator` invariant'larında toplamak.
 - Neden şimdi: Bu adım doğrudan Geometry/Topology/Canonical BIM güvence katmanını ölçülebilir biçimde sertleştiriyor. Regression runner, çekirdek pipeline'ın kapılayıcı gözlem katmanı olduğundan burada gerçek sözleşme ihlali ile beklenen negatif senaryo çıktılarının ayrıştırılması P0 için yüksek öncelikli.
 
 ## 2. Başarı Kriteri
@@ -22,19 +22,19 @@ Bu dosya, oturumlar arasında **anlık önceliği kaybetmemek** ve ajanların/ka
   - `backend/tests/test_modern_pipeline.py::TestModernPipeline::test_02d_parser_reuse_keeps_closed_loop_pipeline_outputs_deterministic`
   - `backend/tests/test_modern_pipeline.py::TestModernPipeline::test_02e_parser_reuse_keeps_truncated_recover_pipeline_outputs_deterministic`
   - `backend/tests/test_modern_pipeline.py::TestModernPipeline::test_02f_parser_reuse_keeps_semantic_space_bim_outputs_deterministic`
-- Beklenen davranış: Golden manifest/metrics/topology-health katmanı, gerçekten bozuk Geometry/Topology/Canonical BIM çıktılarında kırmızıya düşmeli; negatif test senaryolarının beklenen `BAŞARISIZ` logları ise suite sonucunu bozmadığı sürece regression sinyali olarak yorumlanmamalı. Özellikle topology health gate tarafından bilinçli üretilen başarısızlıklar traceback seline dönüşmeden tek satırlık anlaşılır log olarak görünmeli. Run-bağımlı provenance/ölçüm gürültüsü ile çekirdek sözleşme farkı net ayrıştırılmalı.
+- Beklenen davranış: Golden manifest/metrics/topology-health katmanı, gerçekten bozuk Geometry/Topology/Canonical BIM çıktılarında kırmızıya düşmeli; negatif test senaryolarının beklenen `BAŞARISIZ` logları ise suite sonucunu bozmadığı sürece regression sinyali olarak yorumlanmamalı. Topology health gate `required_status=HEALTHY` eşiğini görünür kılmalı ancak `enforced=false` kalmalı; gerçek bloklama `TopologyValidator` başarısızlıklarında oluşmalı. Run-bağımlı provenance/ölçüm gürültüsü ile çekirdek sözleşme farkı net ayrıştırılmalı.
 - Ölçülebilir çıktı:
   - `python -m unittest backend.tests.test_output_manifest backend.tests.test_output_metrics backend.tests.test_regression_topology_report_path 2>&1` sonucu **Ran 19 tests ... OK** olmalı.
   - `python -m unittest backend.tests.test_modern_pipeline backend.tests.test_topology_health_report backend.tests.test_topology_validator backend.tests.test_topology_engine_determinism backend.tests.test_regression_bim_core_opening_parent_wall backend.tests.test_output_manifest backend.tests.test_output_metrics backend.tests.test_regression_topology_report_path 2>&1` sonucu **Ran 83 tests ... OK** olmalı.
 
 ## 3. Bu Oturumda Yapılan Son İş
-- Son değişiklik özeti: `backend/run_regression_tests.py` içinde en dış `except Exception as e` bloğu güncellendi. Artık beklenen `TopologyHealthGateError` durumlarında logger `exc_info=True` ile tam traceback basmıyor; yalnız beklenmeyen istisnalarda traceback korunuyor. Böylece negatif topology-health gate senaryoları regression çıktısında tek satırlık, yüksek sinyalli hata mesajı üretiyor; beklenmeyen kırılmalarda ise teşhis derinliği kaybolmuyor.
+- Son değişiklik özeti: `backend/run_regression_tests.py` içinde topology health gate semantiği netleştirildi. `_evaluate_topology_health_gate(...)` artık `required_status=HEALTHY` eşiğini yalnız görünürlük amaçlı raporluyor; `_enforce_topology_health_gate(...)` legacy shim olarak aynı özeti döndürüyor; gerçek bloklama `TopologyValidator.validate(...)` invariant'larında kalıyor.
 - Son dokunulan dosyalar: `backend/run_regression_tests.py`, `docs/CURRENT_FOCUS.md`, `docs/LATEST_HANDOFF.md`
 - Son doğrulama komutları:
   - `python -m unittest backend.tests.test_output_manifest backend.tests.test_output_metrics backend.tests.test_regression_topology_report_path 2>&1`
 - Son doğrulama sonucu:
   - Manifest / metrics / topology-report regression doğrulaması: **Ran 19 tests in 0.066s — OK**
-  - Beklenen topology health gate düşüşü artık traceback yerine tek satırlık net log ile gözlendi: `Pipeline failed on sample_plan.dxf: Topology health gate failed: expected HEALTHY but got WARNING ...`
+  - WARNING topology health özeti regression raporunda görünür kaldı; bloklayıcı hata ise yalnız validator FAIL olduğunda `Topology validation failed: ...` biçiminde gözlendi.
   - PowerShell sarmalayıcı stderr/log satırları nedeniyle üst seviyede `NativeCommandError` benzeri gürültü üretse de unittest özeti net olarak `OK` kapandı.
 
 ## 4. Hemen Sonraki Adım

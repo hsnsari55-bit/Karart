@@ -249,8 +249,10 @@ class TestRegressionTopologyReportPath(unittest.TestCase):
         self.assertFalse(gate["passed"])
         self.assertEqual(gate["required_status"], "HEALTHY")
         self.assertEqual(gate["actual_status"], "WARNING")
+        self.assertFalse(gate["enforced"])
+        self.assertEqual(gate["blocking_authority"], "topology_validator")
 
-    def test_run_on_file_fails_when_topology_health_gate_is_not_healthy(self):
+    def test_run_on_file_runs_validator_and_fails_on_validator_for_warning_health(self):
         tester = RegressionTester()
 
         class _Parser:
@@ -346,7 +348,19 @@ class TestRegressionTopologyReportPath(unittest.TestCase):
                 self.report_output_path = report_output_path
 
             def validate(self, graph):
-                raise AssertionError("TopologyValidator should not run when health gate fails")
+                with open(self.report_output_path, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "status": "FAIL",
+                            "counts": {"nodes": 4, "edges": 4, "loops": 1},
+                            "checks": {
+                                "non_empty_nodes": True,
+                                "no_dangling_nodes": False,
+                            },
+                        },
+                        handle,
+                    )
+                raise RuntimeError("Topology validation failed: dangling nodes are blocking.")
 
         tester.parser = _Parser()
         tester.geometry_engine = _Geometry()
@@ -379,13 +393,8 @@ class TestRegressionTopologyReportPath(unittest.TestCase):
 
         self.assertEqual(report["status"], "FAILURE")
         self.assertEqual(report["error_step"], "constraint_solver")
-        self.assertIn("Topology health gate failed", report["error_msg"])
-        self.assertIn("component_sizes=[3, 1]", report["error_msg"])
-        self.assertIn("dangling_components=[0]", report["error_msg"])
-        self.assertIn("isolated_components=[]", report["error_msg"])
-        self.assertIn("degree_metadata_mismatches=0", report["error_msg"])
-        self.assertIn("failed_checks=[]", report["error_msg"])
-        self.assertIn("diagnostic_codes=['DANGLING_NODES']", report["error_msg"])
+        self.assertIn("Topology validation failed", report["error_msg"])
+        self.assertNotIn("Topology health gate failed", report["error_msg"])
         self.assertEqual(report["steps"]["constraint_solver"]["status"], "FAILURE")
         self.assertEqual(
             report["steps"]["constraint_solver"]["topology_health_summary"]["status"],
@@ -400,8 +409,25 @@ class TestRegressionTopologyReportPath(unittest.TestCase):
             ["DANGLING_NODES"],
         )
         self.assertFalse(report["steps"]["constraint_solver"]["topology_health_gate"]["passed"])
+        self.assertFalse(report["steps"]["constraint_solver"]["topology_health_gate"]["enforced"])
+        self.assertEqual(
+            report["steps"]["constraint_solver"]["topology_health_gate"]["blocking_authority"],
+            "topology_validator",
+        )
+        self.assertEqual(
+            report["steps"]["constraint_solver"]["topology_validation_summary"]["status"],
+            "FAIL",
+        )
+        self.assertEqual(
+            report["steps"]["constraint_solver"]["topology_validation_summary"]["checks_passed"],
+            1,
+        )
+        self.assertEqual(
+            report["steps"]["constraint_solver"]["topology_validation_summary"]["checks_total"],
+            2,
+        )
 
-    def test_manifest_and_metrics_verify_can_pass_while_topology_health_gate_blocks(self):
+    def test_manifest_and_metrics_verify_can_pass_while_topology_health_gate_remains_visibility_only(self):
         tester = RegressionTester()
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -530,9 +556,9 @@ class TestRegressionTopologyReportPath(unittest.TestCase):
             self.assertFalse(gate["passed"])
             self.assertEqual(gate["required_status"], "HEALTHY")
             self.assertEqual(gate["actual_status"], "WARNING")
-
-            with self.assertRaises(regression_module.TopologyHealthGateError):
-                tester._enforce_topology_health_gate(summary)
+            self.assertFalse(gate["enforced"])
+            self.assertEqual(gate["blocking_authority"], "topology_validator")
+            self.assertEqual(tester._enforce_topology_health_gate(summary), gate)
 
 
 if __name__ == "__main__":

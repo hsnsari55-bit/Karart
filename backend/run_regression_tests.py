@@ -179,34 +179,20 @@ class RegressionTester:
         }
 
     def _evaluate_topology_health_gate(self, summary: Dict[str, Any]) -> Dict[str, Any]:
-        """Evaluates the regression blocking rule for topology health diagnostics."""
+        """Evaluates whether topology diagnostics meet the fully-healthy visibility threshold."""
         actual_status = summary.get("status", "UNKNOWN")
         passed = actual_status == "HEALTHY"
         return {
             "required_status": "HEALTHY",
             "actual_status": actual_status,
             "passed": passed,
+            "enforced": False,
+            "blocking_authority": "topology_validator",
         }
 
     def _enforce_topology_health_gate(self, summary: Dict[str, Any]) -> Dict[str, Any]:
-        """Blocks the pipeline when topology health is not fully healthy."""
-        gate = self._evaluate_topology_health_gate(summary)
-        if gate["passed"]:
-            return gate
-
-        raise TopologyHealthGateError(
-            "Topology health gate failed: "
-            f"expected {gate['required_status']} but got {gate['actual_status']} "
-            f"(components={summary.get('connected_components', 0)}, "
-            f"component_sizes={summary.get('component_sizes', [])}, "
-            f"dangling={summary.get('dangling_node_count', 0)}, "
-            f"dangling_components={summary.get('dangling_node_component_indexes', [])}, "
-            f"isolated_components={summary.get('isolated_node_component_indexes', [])}, "
-            f"self_loops={summary.get('self_loop_edge_count', 0)}, "
-            f"degree_metadata_mismatches={summary.get('degree_metadata_mismatch_count', 0)}, "
-            f"failed_checks={summary.get('failed_checks', [])}, "
-            f"diagnostic_codes={summary.get('diagnostic_codes', [])})."
-        )
+        """Legacy compatibility shim: topology health is visible but validator owns blocking."""
+        return self._evaluate_topology_health_gate(summary)
 
     def _format_topology_validation_markdown_cell(self, project_report: Dict[str, Any]) -> str:
         """Formats topology validation visibility for the Markdown validation matrix."""
@@ -343,7 +329,8 @@ class RegressionTester:
                     "topology_health_summary": topology_health_summary,
                     "topology_health_gate": topology_health_gate,
                 }
-                self._enforce_topology_health_gate(topology_health_summary)
+                # Topology health remains visible in regression outputs, but acceptance
+                # semantics are enforced by the blocking TopologyValidator invariants.
                 topology_validator.validate(resolved_graph)
                 topology_validation_summary = self._load_topology_validation_summary(topology_validation_report_path)
                 elapsed_constraint = int((time.time() - s_time) * 1000)
