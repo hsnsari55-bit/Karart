@@ -28,7 +28,10 @@ class GeometryEngine:
         self.collinear_angle_deg = self.config.get("tolerances.collinear_angle_threshold_deg", 2.5)
         self.min_length = self.config.get("tolerances.min_segment_length_mm", 1.0)
         self.min_wall_area = self.config.get("tolerances.min_wall_area_mm2", 50.0)
-        
+
+        self._reset_stats()
+
+    def _reset_stats(self):
         # Statistics for QA Report & Production Benchmarking
         self.stats = {
             "initial_entities": 0,
@@ -218,6 +221,7 @@ class GeometryEngine:
 
     def run(self) -> List[Dict[str, Any]]:
         start_time = time.time()
+        self._reset_stats()
         raw_path = self.path_manager.get_path('outputs', 'dxf_raw.json')
         if not os.path.exists(raw_path):
             self.logger.error("dxf_raw.json not found.")

@@ -445,6 +445,168 @@ class TestModernPipeline(unittest.TestCase):
         self.assertEqual(first_run["persisted_clean_walls"], second_run["persisted_clean_walls"])
         self.assertEqual(first_run["geometry_sha256"], second_run["geometry_sha256"])
 
+    def test_01eaa_geometry_engine_does_not_snap_when_distance_equals_tolerance(self):
+        """Binary-exact equality to snap tolerance should not snap because the contract is strict `<`."""
+        engine = self._bind_engine(GeometryEngine())
+        original_get = engine.config.get
+        engine.config.get = lambda key, default=None: (
+            0.125 if key == "tolerances.snapping_distance_mm" else original_get(key, default)
+        )
+        engine.snap_tolerance = 0.125
+
+        raw_payload = {
+            "project": "Snap Equality Boundary Fixture",
+            "source_file": "snap_equality_boundary.dxf",
+            "bounding_box": {"min_x": 0.0, "min_y": 0.0, "max_x": 1.125, "max_y": 1.0},
+            "entities": [
+                {
+                    "type": "LINE",
+                    "layer": "duvar",
+                    "block_name": "default",
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "end": {"x": 1.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "LINE",
+                    "layer": "duvar",
+                    "block_name": "default",
+                    "start": {"x": 1.125, "y": 0.0, "z": 0.0},
+                    "end": {"x": 1.125, "y": 1.0, "z": 0.0},
+                },
+            ],
+        }
+
+        expected_walls = [
+            {
+                "type": "LWPOLYLINE",
+                "layer": "duvar",
+                "block_name": "default",
+                "closed": False,
+                "points": [[0.0, 0.0], [1.0, 0.0]],
+            },
+            {
+                "type": "LWPOLYLINE",
+                "layer": "duvar",
+                "block_name": "default",
+                "closed": False,
+                "points": [[1.125, 0.0], [1.125, 1.0]],
+            },
+        ]
+
+        with open(self.test_outputs["dxf_raw"], "w", encoding="utf-8") as f:
+            json.dump(raw_payload, f, indent=4)
+
+        clean_walls = engine.run()
+
+        with open(self.test_outputs["walls_clean"], "r", encoding="utf-8") as f:
+            persisted_clean_walls = json.load(f)
+
+        self.assertEqual(clean_walls, expected_walls)
+        self.assertEqual(persisted_clean_walls, expected_walls)
+        self.assertEqual(persisted_clean_walls, clean_walls)
+        self.assertEqual(engine.stats["points_snapped_count"], 0)
+        self.assertEqual(engine.stats["avg_snap_distance_mm"], 0.0)
+        self.assertEqual(engine.stats["max_snap_distance_mm"], 0.0)
+        self.assertEqual(engine.stats["overlapping_merged"], 0)
+        self.assertEqual(engine.stats["total_segments_out"], 2)
+        self.assertEqual(
+            engine.stats["geometry_sha256"],
+            "1054cf5e9000551a3b3de83961bfd430e5eb7f249919d6026e71db847a67e831",
+        )
+
+    def test_01ea_geometry_engine_reuse_resets_stats_between_runs(self):
+        """Reusing the same GeometryEngine instance should not accumulate QA stats across identical runs."""
+        engine = self._bind_engine(GeometryEngine())
+        original_get = engine.config.get
+        engine.config.get = lambda key, default=None: (
+            0.1 if key == "tolerances.snapping_distance_mm" else original_get(key, default)
+        )
+        engine.snap_tolerance = 0.1
+
+        raw_payload = {
+            "project": "Snapping Reuse Fixture",
+            "source_file": "snapping_reuse_fixture.dxf",
+            "bounding_box": {"min_x": 0.0, "min_y": 0.0, "max_x": 10.04, "max_y": 5.0},
+            "entities": [
+                {
+                    "type": "LINE",
+                    "layer": "duvar",
+                    "block_name": "default",
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "end": {"x": 10.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "LINE",
+                    "layer": "duvar",
+                    "block_name": "default",
+                    "start": {"x": 10.04, "y": 0.0, "z": 0.0},
+                    "end": {"x": 10.04, "y": 5.0, "z": 0.0},
+                },
+            ],
+        }
+
+        expected_walls = [
+            {
+                "type": "LWPOLYLINE",
+                "layer": "duvar",
+                "block_name": "default",
+                "closed": False,
+                "points": [[0.0, 0.0], [10.0, 0.0]],
+            },
+            {
+                "type": "LWPOLYLINE",
+                "layer": "duvar",
+                "block_name": "default",
+                "closed": False,
+                "points": [[10.0, 0.0], [10.04, 5.0]],
+            },
+        ]
+
+        expected_stats = {
+            "initial_entities": 2,
+            "zero_length_removed": 0,
+            "points_snapped_count": 1,
+            "avg_snap_distance_mm": 0.04,
+            "max_snap_distance_mm": 0.04,
+            "overlapping_merged": 0,
+            "total_segments_out": 2,
+            "geometry_sha256": "6244f2878c6cd39d4b7d9a37b2e9e23ec838d27d68d0da3db898197999c98b45",
+        }
+
+        with open(self.test_outputs["dxf_raw"], "w", encoding="utf-8") as f:
+            json.dump(raw_payload, f, indent=4)
+
+        first_clean_walls = engine.run()
+
+        with open(self.test_outputs["walls_clean"], "r", encoding="utf-8") as f:
+            first_persisted_clean_walls = json.load(f)
+
+        first_stats = {key: engine.stats[key] for key in expected_stats}
+
+        with open(self.test_outputs["dxf_raw"], "w", encoding="utf-8") as f:
+            json.dump(raw_payload, f, indent=4)
+
+        second_clean_walls = engine.run()
+
+        with open(self.test_outputs["walls_clean"], "r", encoding="utf-8") as f:
+            second_persisted_clean_walls = json.load(f)
+
+        second_stats = {key: engine.stats[key] for key in expected_stats}
+
+        self.assertEqual(first_clean_walls, expected_walls)
+        self.assertEqual(first_persisted_clean_walls, expected_walls)
+        self.assertEqual(first_persisted_clean_walls, first_clean_walls)
+        self.assertEqual(first_stats, expected_stats)
+
+        self.assertEqual(second_clean_walls, expected_walls)
+        self.assertEqual(second_persisted_clean_walls, expected_walls)
+        self.assertEqual(second_persisted_clean_walls, second_clean_walls)
+        self.assertEqual(second_stats, expected_stats)
+
+        self.assertEqual(first_clean_walls, second_clean_walls)
+        self.assertEqual(first_persisted_clean_walls, second_persisted_clean_walls)
+        self.assertEqual(first_stats, second_stats)
+
     def test_01f_geometry_engine_repairs_self_intersecting_closed_polygon_into_deterministic_segments(self):
         """Self-intersecting closed wall polylines should repair into the exact observed deterministic segment set."""
         engine = self._bind_engine(GeometryEngine())
