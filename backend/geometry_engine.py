@@ -28,7 +28,10 @@ class GeometryEngine:
         self.collinear_angle_deg = self.config.get("tolerances.collinear_angle_threshold_deg", 2.5)
         self.min_length = self.config.get("tolerances.min_segment_length_mm", 1.0)
         self.min_wall_area = self.config.get("tolerances.min_wall_area_mm2", 50.0)
-        
+
+        self._reset_stats()
+
+    def _reset_stats(self):
         # Statistics for QA Report & Production Benchmarking
         self.stats = {
             "initial_entities": 0,
@@ -218,6 +221,7 @@ class GeometryEngine:
 
     def run(self) -> List[Dict[str, Any]]:
         start_time = time.time()
+        self._reset_stats()
         raw_path = self.path_manager.get_path('outputs', 'dxf_raw.json')
         if not os.path.exists(raw_path):
             self.logger.error("dxf_raw.json not found.")
@@ -264,7 +268,10 @@ class GeometryEngine:
                 pts = sorted([p0, p1])
                 return (layer, bname, etype, pts[0], pts[1])
             elif etype in ['LWPOLYLINE', 'POLYLINE']:
-                pts = [(round(p.get('x', 0), 2), round(p.get('y', 0), 2)) for p in ent.get('points', [])]
+                pts = [
+                    (round(p.get('x', 0), 2), round(p.get('y', 0), 2))
+                    for p in ent.get('vertices', ent.get('points', []))
+                ]
                 first_pt = pts[0] if pts else (0, 0)
                 return (layer, bname, etype, first_pt)
             return (layer, bname, etype, (0, 0))
