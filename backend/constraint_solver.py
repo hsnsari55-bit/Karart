@@ -8,13 +8,36 @@ from backend.path_manager import PathManager
 class ConstraintSolver:
     """
     Constraint Solver (Step 4 of KaRar Pipeline)
-    Resolves topological graph conflicts, wall overlaps, and element collision constraints deterministically.
+    Deterministically filters and deduplicates topology graph edges, passes graph structure
+    through with resolved-artifact metadata, and persists the resolved graph output.
     """
     RESOLVED_GRAPH_FILENAME = "geometry_graph_resolved.json"
 
     def __init__(self):
         self.logger = logging.getLogger('KaRar-ConstraintSolver')
         self.path_manager = PathManager()
+
+    @staticmethod
+    def _stable_serialize(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+
+    def _edge_pair_key(self, edge: Dict[str, Any]):
+        return tuple(
+            sorted(
+                (
+                    self._stable_serialize(edge.get("from")),
+                    self._stable_serialize(edge.get("to")),
+                )
+            )
+        )
+
+    def _edge_rank(self, edge: Dict[str, Any]) -> str:
+        normalized_edge = {
+            **edge,
+            "from": self._edge_pair_key(edge)[0],
+            "to": self._edge_pair_key(edge)[1],
+        }
+        return self._stable_serialize(normalized_edge)
 
     def run(self, graph: Dict[str, Any]) -> Dict[str, Any]:
         self.logger.info("Executing Constraint Solver on topology graph...")
@@ -26,18 +49,31 @@ class ConstraintSolver:
 
         # Deterministic constraint resolution:
         # 1. Remove duplicate overlapping edges by (from, to) node pair
-        resolved_edges = []
-        seen_edges = set()
+        best_edges_by_pair = {}
 
         for edge in edges:
             n0 = edge.get("from")
             n1 = edge.get("to")
             if n0 is None or n1 is None or n0 == n1:
                 continue
-            key = tuple(sorted([n0, n1]))
-            if key not in seen_edges:
-                seen_edges.add(key)
-                resolved_edges.append(edge)
+            key = self._edge_pair_key(edge)
+            rank = self._edge_rank(edge)
+            current = best_edges_by_pair.get(key)
+            if current is None or rank < current[0]:
+                best_edges_by_pair[key] = (rank, edge)
+
+        resolved_edges = []
+        emitted_pairs = set()
+        for edge in edges:
+            n0 = edge.get("from")
+            n1 = edge.get("to")
+            if n0 is None or n1 is None or n0 == n1:
+                continue
+            key = self._edge_pair_key(edge)
+            if key in emitted_pairs:
+                continue
+            emitted_pairs.add(key)
+            resolved_edges.append(best_edges_by_pair[key][1])
 
         resolved_graph = {
             **graph,
