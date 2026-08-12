@@ -1,14 +1,17 @@
+import inspect
 import json
 import os
 import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 
+from backend.config import ConfigManager
 from backend.topology_engine import TopologyEngine
 from backend.topology_health_report import TopologyHealthReporter
 
@@ -31,6 +34,26 @@ class TestTopologyEngineDeterminism(unittest.TestCase):
 
             graph = engine.run()
             return graph, engine.stats["topology_sha256"]
+
+    def _run_engine_with_stats(self, walls, snap_tolerance=None):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            outputs_dir = os.path.join(temp_dir, "outputs")
+            os.makedirs(outputs_dir, exist_ok=True)
+
+            walls_path = os.path.join(outputs_dir, "walls_clean.json")
+            with open(walls_path, "w", encoding="utf-8") as handle:
+                json.dump(walls, handle, indent=2)
+
+            engine = TopologyEngine()
+            if snap_tolerance is not None:
+                engine.snap_tolerance = snap_tolerance
+            engine.path_manager = types.SimpleNamespace(
+                get_path=lambda *parts: os.path.join(temp_dir, *parts),
+                get_relative_path=lambda path: path,
+            )
+
+            graph = engine.run()
+            return graph, dict(engine.stats)
 
     def _generate_health_report(self, graph):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -275,6 +298,110 @@ class TestTopologyEngineDeterminism(unittest.TestCase):
         self.assertEqual(engine.stats["final_nodes"], 4)
         self.assertEqual(engine.stats["final_edges"], 3)
         self.assertEqual(engine.stats["closed_loops_found"], 0)
+
+    def test_topology_snap_tolerance_source_prefers_config_and_defaults_to_5mm(self):
+        with patch.object(
+            ConfigManager,
+            "get",
+            side_effect=lambda key, default=None: 0.125 if key == "tolerances.snapping_distance_mm" else default,
+        ):
+            configured_engine = TopologyEngine()
+
+        with patch.object(ConfigManager, "get", side_effect=lambda key, default=None: default):
+            default_engine = TopologyEngine()
+
+        self.assertEqual(configured_engine.snap_tolerance, 0.125)
+        self.assertEqual(default_engine.snap_tolerance, 5.0)
+
+    def test_topology_t_junction_production_code_uses_strict_distance_comparison(self):
+        init_source = inspect.getsource(TopologyEngine.__init__).replace(" ", "")
+        run_source = inspect.getsource(TopologyEngine.run).replace(" ", "")
+
+        self.assertIn(
+            'self.snap_tolerance=self.config.get("tolerances.snapping_distance_mm",5.0)',
+            init_source,
+        )
+        self.assertIn("0.001<t<0.999", run_source)
+        self.assertIn("1e-4<d<self.snap_tolerance", run_source)
+
+    def test_t_junction_boundary_contract_below_equal_above_tolerance_is_deterministic(self):
+        snap_tolerance = 0.125
+        cases = {
+            "below": {
+                "offset": 0.0625,
+                "expected_hash": "6ff1b3d962546c046bb851ed968c4d5ff4d5b2c2276954918d8e1840b2569513",
+                "expected_t_junctions_snapped": 1,
+                "expected_T_nodes_count": 1,
+                "expected_nodes": [
+                    {"id": 0, "x": 0.0, "y": 0.0, "degree": 1, "type": "end"},
+                    {"id": 1, "x": 5.0, "y": 0.0, "degree": 3, "type": "T"},
+                    {"id": 2, "x": 5.0, "y": 5.0, "degree": 1, "type": "end"},
+                    {"id": 3, "x": 10.0, "y": 0.0, "degree": 1, "type": "end"},
+                ],
+                "expected_edges": [
+                    {"id": 0, "from": 0, "to": 1, "length": 5.0, "angle": 0.0},
+                    {"id": 1, "from": 1, "to": 2, "length": 5.0, "angle": 90.0},
+                    {"id": 2, "from": 1, "to": 3, "length": 5.0, "angle": 0.0},
+                ],
+                "expected_counts": {"nodes": 4, "edges": 3, "loops": 0},
+            },
+            "equal": {
+                "offset": 0.125,
+                "expected_hash": "70e62d6ad5c42802adeb73d47b05c849f2fa06014ef4342d649adf6750ce20e7",
+                "expected_t_junctions_snapped": 0,
+                "expected_T_nodes_count": 0,
+                "expected_nodes": [
+                    {"id": 0, "x": 0.0, "y": 0.0, "degree": 1, "type": "end"},
+                    {"id": 1, "x": 5.0, "y": 0.125, "degree": 1, "type": "end"},
+                    {"id": 2, "x": 5.0, "y": 5.0, "degree": 1, "type": "end"},
+                    {"id": 3, "x": 10.0, "y": 0.0, "degree": 1, "type": "end"},
+                ],
+                "expected_edges": [
+                    {"id": 0, "from": 0, "to": 3, "length": 10.0, "angle": 0.0},
+                    {"id": 1, "from": 1, "to": 2, "length": 4.875, "angle": 90.0},
+                ],
+                "expected_counts": {"nodes": 4, "edges": 2, "loops": 0},
+            },
+            "above": {
+                "offset": 0.1875,
+                "expected_hash": "f5596c974d5474403826cbcdf7a9814d68ace530f54deb4666fca7fb335c2165",
+                "expected_t_junctions_snapped": 0,
+                "expected_T_nodes_count": 0,
+                "expected_nodes": [
+                    {"id": 0, "x": 0.0, "y": 0.0, "degree": 1, "type": "end"},
+                    {"id": 1, "x": 5.0, "y": 0.188, "degree": 1, "type": "end"},
+                    {"id": 2, "x": 5.0, "y": 5.0, "degree": 1, "type": "end"},
+                    {"id": 3, "x": 10.0, "y": 0.0, "degree": 1, "type": "end"},
+                ],
+                "expected_edges": [
+                    {"id": 0, "from": 0, "to": 3, "length": 10.0, "angle": 0.0},
+                    {"id": 1, "from": 1, "to": 2, "length": 4.812, "angle": 90.0},
+                ],
+                "expected_counts": {"nodes": 4, "edges": 2, "loops": 0},
+            },
+        }
+
+        for case_name, case in cases.items():
+            walls = [
+                {"wall_id": 301, "layer": "duvar", "points": [[0.0, 0.0], [10.0, 0.0]], "thickness": 25.0},
+                {"wall_id": 302, "layer": "duvar", "points": [[5.0, case["offset"]], [5.0, 5.0]], "thickness": 25.0},
+            ]
+
+            with self.subTest(case=case_name):
+                graph_first, stats_first = self._run_engine_with_stats(walls, snap_tolerance=snap_tolerance)
+                graph_second, stats_second = self._run_engine_with_stats(walls, snap_tolerance=snap_tolerance)
+
+                self.assertEqual(graph_first, graph_second)
+                self.assertEqual(stats_first["topology_sha256"], stats_second["topology_sha256"])
+                self.assertEqual(stats_first["topology_sha256"], case["expected_hash"])
+                self.assertEqual(stats_first["t_junctions_snapped"], case["expected_t_junctions_snapped"])
+                self.assertEqual(stats_first["T_nodes_count"], case["expected_T_nodes_count"])
+                self.assertEqual(stats_first["final_nodes"], case["expected_counts"]["nodes"])
+                self.assertEqual(stats_first["final_edges"], case["expected_counts"]["edges"])
+                self.assertEqual(stats_first["closed_loops_found"], case["expected_counts"]["loops"])
+                self.assertEqual(graph_first["nodes"], case["expected_nodes"])
+                self.assertEqual(graph_first["edges"], case["expected_edges"])
+                self.assertEqual(graph_first["loops"], [])
 
     def test_collinear_segments_are_classified_with_single_straight_node_deterministically(self):
         walls_a = [
