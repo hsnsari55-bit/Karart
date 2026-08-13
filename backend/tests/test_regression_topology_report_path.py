@@ -303,15 +303,15 @@ class TestRegressionTopologyReportPath(unittest.TestCase):
                 return graph
 
         class _Semantic:
-            def run(self):
+            def run(self, graph_data=None):
                 return {"elements": []}
 
         class _Space:
-            def run(self):
+            def run(self, graph_data=None):
                 return {"spaces": []}
 
         class _BimCore:
-            def run(self):
+            def run(self, graph_data=None):
                 return {"walls": [], "spaces": []}
 
         class _HealthReporter:
@@ -426,6 +426,158 @@ class TestRegressionTopologyReportPath(unittest.TestCase):
             report["steps"]["constraint_solver"]["topology_validation_summary"]["checks_total"],
             2,
         )
+
+    def test_run_on_file_forwards_validated_resolved_graph_to_all_consumers(self):
+        tester = RegressionTester()
+
+        topology_graph = {
+            "nodes": [
+                {"id": 0, "x": 0.0, "y": 0.0, "degree": 2},
+                {"id": 1, "x": 10.0, "y": 0.0, "degree": 2},
+            ],
+            "edges": [{"id": 1, "from": 0, "to": 1, "length": 10.0}],
+            "loops": [],
+        }
+        resolved_graph = {
+            "nodes": [
+                {"id": 0, "x": 0.0, "y": 0.0, "degree": 1},
+                {"id": 1, "x": 10.0, "y": 0.0, "degree": 1},
+            ],
+            "edges": [{"id": 99, "from": 0, "to": 1, "length": 10.0}],
+            "loops": [],
+            "validated": True,
+        }
+
+        class _Parser:
+            def parse(self, filepath):
+                return {"source": filepath}
+
+        class _Geometry:
+            stats = {"segments_in": 1, "segments_out": 1}
+
+            def run(self):
+                return [{"wall_id": 1}]
+
+        class _Topology:
+            stats = {"nodes": 2, "edges": 1, "loops": 0}
+
+            def run(self):
+                return topology_graph
+
+        class _ConstraintSolver:
+            def __init__(self):
+                self.received = None
+
+            def run(self, graph):
+                self.received = graph
+                return resolved_graph
+
+        received_graphs = {}
+
+        class _Semantic:
+            def run(self, graph_data=None):
+                received_graphs["semantic"] = graph_data
+                return {"elements": []}
+
+        class _Space:
+            def run(self, graph_data=None):
+                received_graphs["spaces"] = graph_data
+                return {"spaces": []}
+
+        class _BimCore:
+            def run(self, graph_data=None):
+                received_graphs["bim_core"] = graph_data
+                return {"walls": [], "spaces": []}
+
+        class _HealthReporter:
+            def __init__(self, report_output_path):
+                self.report_output_path = report_output_path
+
+            def generate(self, graph):
+                received_graphs["health_reporter"] = graph
+                report = {
+                    "status": "HEALTHY",
+                    "counts": {"nodes": 2, "edges": 1, "loops": 0},
+                    "checks": {
+                        "has_nodes": True,
+                        "has_edges": True,
+                        "has_loops": True,
+                        "degree_metadata_consistency": True,
+                    },
+                    "graph_metrics": {
+                        "connected_components": 1,
+                        "component_sizes": [2],
+                        "component_size_histogram": {"2": 1},
+                        "dangling_node_count": 0,
+                        "dangling_node_component_indexes": [],
+                        "self_loop_edge_count": 0,
+                        "isolated_node_component_indexes": [],
+                        "degree_metadata_mismatches": [],
+                    },
+                    "diagnostics": [],
+                }
+                with open(self.report_output_path, "w", encoding="utf-8") as handle:
+                    json.dump(report, handle)
+                return report
+
+        class _Validator:
+            def __init__(self, report_output_path):
+                self.report_output_path = report_output_path
+
+            def validate(self, graph):
+                received_graphs["validator"] = graph
+                with open(self.report_output_path, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "status": "PASS",
+                            "counts": {"nodes": 2, "edges": 1, "loops": 0},
+                            "checks": {
+                                "non_empty_nodes": True,
+                                "non_empty_edges": True,
+                            },
+                        },
+                        handle,
+                    )
+
+        tester.parser = _Parser()
+        tester.geometry_engine = _Geometry()
+        tester.topology_engine = _Topology()
+        constraint_solver = _ConstraintSolver()
+        tester.constraint_solver = constraint_solver
+        tester.semantic_engine = _Semantic()
+        tester.space_engine = _Space()
+        tester.bim_core_engine = _BimCore()
+        tester.path_manager = types.SimpleNamespace(
+            get_relative_path=lambda path: path,
+            get_path=lambda *parts: os.path.join(*parts),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            health_report_path = os.path.join(temp_dir, "topology_health_sample_plan.json")
+            validation_report_path = os.path.join(temp_dir, "topology_validation_sample_plan.json")
+
+            tester._build_topology_health_report_path = lambda filename: health_report_path
+            tester._build_topology_validation_report_path = lambda filename: validation_report_path
+
+            original_health_reporter = regression_module.TopologyHealthReporter
+            original_validator = regression_module.TopologyValidator
+            regression_module.TopologyHealthReporter = _HealthReporter
+            regression_module.TopologyValidator = _Validator
+            try:
+                report = tester.run_on_file("sample_plan.dxf")
+            finally:
+                regression_module.TopologyHealthReporter = original_health_reporter
+                regression_module.TopologyValidator = original_validator
+
+        self.assertEqual(report["status"], "SUCCESS")
+        self.assertIs(constraint_solver.received, topology_graph)
+        self.assertIs(received_graphs["health_reporter"], resolved_graph)
+        self.assertIs(received_graphs["validator"], resolved_graph)
+        self.assertIs(received_graphs["semantic"], resolved_graph)
+        self.assertIs(received_graphs["spaces"], resolved_graph)
+        self.assertIs(received_graphs["bim_core"], resolved_graph)
+        self.assertIsNot(received_graphs["semantic"], topology_graph)
+        self.assertEqual(received_graphs["semantic"]["edges"][0]["id"], 99)
 
     def test_manifest_and_metrics_verify_can_pass_while_topology_health_gate_remains_visibility_only(self):
         tester = RegressionTester()

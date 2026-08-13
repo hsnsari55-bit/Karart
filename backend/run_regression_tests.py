@@ -362,7 +362,7 @@ class RegressionTester:
             # Step 4: Semantic Classification
             s_time = time.time()
             self.logger.info("  Step 4: Semantic Engine...")
-            semantics = self.semantic_engine.run()
+            semantics = self.semantic_engine.run(graph_data=resolved_graph)
             elapsed = int((time.time() - s_time) * 1000)
             report["steps"]["semantic"] = {"status": "SUCCESS", "time_ms": elapsed}
             report["metrics"]["semantic_accuracy"] = 100.0
@@ -370,7 +370,7 @@ class RegressionTester:
             # Step 5: Space/Room Extraction
             s_time = time.time()
             self.logger.info("  Step 5: Space Engine...")
-            spaces = self.space_engine.run()
+            spaces = self.space_engine.run(graph_data=resolved_graph)
             elapsed = int((time.time() - s_time) * 1000)
             report["steps"]["spaces"] = {"status": "SUCCESS", "time_ms": elapsed}
             found_rooms = len(spaces.get("spaces", []))
@@ -380,7 +380,7 @@ class RegressionTester:
             # Step 6: Canonical BIM Assemble
             s_time = time.time()
             self.logger.info("  Step 6: BIM Core Engine...")
-            bim_model = self.bim_core_engine.run()
+            bim_model = self.bim_core_engine.run(graph_data=resolved_graph)
             elapsed = int((time.time() - s_time) * 1000)
             report["steps"]["core"] = {"status": "SUCCESS", "time_ms": elapsed}
             report["metrics"]["bim_accuracy"] = 100.0

@@ -26,23 +26,28 @@ class SpaceEngine:
             "processing_time_ms": 0
         }
 
-    def run(self) -> Dict[str, Any]:
+    def run(self, graph_data: Dict[str, Any] = None) -> Dict[str, Any]:
         start_time = time.time()
         
         geom_path = self.path_manager.get_path('outputs', 'geometry_graph.json')
         bim_path = self.path_manager.get_path('outputs', 'bim_semantics.json')
         
-        if not os.path.exists(geom_path) or not os.path.exists(bim_path):
-            self.logger.error("Required input files not found.")
+        if graph_data is None and not os.path.exists(geom_path):
+            self.logger.error("Topology graph input file not found.")
+            return {}
+
+        if not os.path.exists(bim_path):
+            self.logger.error("Semantic BIM input file not found.")
             return {}
             
-        with open(geom_path, 'r', encoding='utf-8') as f:
-            geom_data = json.load(f)
+        if graph_data is None:
+            with open(geom_path, 'r', encoding='utf-8') as f:
+                graph_data = json.load(f)
         with open(bim_path, 'r', encoding='utf-8') as f:
             bim_data = json.load(f)
             
-        nodes = geom_data.get('nodes', [])
-        edges = geom_data.get('edges', [])
+        nodes = graph_data.get('nodes', [])
+        edges = graph_data.get('edges', [])
         
         # 1. Identify all physical Wall lines from BIM Semantics
         walls = [el for el in bim_data.get('elements', []) if el['type'] == 'Wall']
