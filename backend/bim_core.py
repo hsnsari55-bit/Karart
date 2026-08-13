@@ -78,12 +78,16 @@ class BIMCoreEngine:
         proj = (v[0] + t * (w[0] - v[0]), v[1] + t * (w[1] - v[1]))
         return self._distance(p, proj)
 
-    def run(self):
+    def _hash_graph_data(self, graph_data):
+        payload = json.dumps(graph_data, sort_keys=True, ensure_ascii=True).encode('utf-8')
+        return hashlib.sha256(payload).hexdigest()
+
+    def run(self, graph_data=None):
         bim_path = self.path_manager.get_path('outputs', 'bim_semantics.json')
         spaces_path = self.path_manager.get_path('outputs', 'spaces.json')
         graph_path = self.path_manager.get_path('outputs', 'geometry_graph.json')
 
-        if not os.path.exists(bim_path) or not os.path.exists(spaces_path) or not os.path.exists(graph_path):
+        if not os.path.exists(bim_path) or not os.path.exists(spaces_path) or (graph_data is None and not os.path.exists(graph_path)):
             self.logger.warning("Missing input files for BIM Core.")
             return
 
@@ -97,10 +101,13 @@ class BIMCoreEngine:
             spaces_sha256 = hashlib.sha256(spaces_bytes).hexdigest()
             spaces = json.loads(spaces_bytes.decode('utf-8')).get("spaces", [])
             
-        with open(graph_path, 'rb') as f:
-            graph_bytes = f.read()
-            graph_sha256 = hashlib.sha256(graph_bytes).hexdigest()
-            graph_data = json.loads(graph_bytes.decode('utf-8'))
+        if graph_data is None:
+            with open(graph_path, 'rb') as f:
+                graph_bytes = f.read()
+                graph_sha256 = hashlib.sha256(graph_bytes).hexdigest()
+                graph_data = json.loads(graph_bytes.decode('utf-8'))
+        else:
+            graph_sha256 = self._hash_graph_data(graph_data)
 
         edges = graph_data.get('edges', [])
         nodes = graph_data.get('nodes', [])

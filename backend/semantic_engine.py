@@ -78,17 +78,23 @@ class SemanticEngine:
 
         return (0.0, 0.0), (0.0, 0.0), 0.0
 
-    def run(self) -> Dict[str, Any]:
+    def run(self, graph_data: Dict[str, Any] = None) -> Dict[str, Any]:
         start_time = time.time()
         
         graph_path = self.path_manager.get_path('outputs', 'geometry_graph.json')
         raw_path = self.path_manager.get_path('outputs', 'dxf_raw.json')
         
-        if not os.path.exists(graph_path) or not os.path.exists(raw_path):
-            self.logger.error("Input files not found.")
+        if graph_data is None and not os.path.exists(graph_path):
+            self.logger.error("Topology graph input file not found.")
+            return {}
+
+        if not os.path.exists(raw_path):
+            self.logger.error("Raw DXF input file not found.")
             return {}
             
-        with open(graph_path, 'r', encoding='utf-8') as f: graph_data = json.load(f)
+        if graph_data is None:
+            with open(graph_path, 'r', encoding='utf-8') as f:
+                graph_data = json.load(f)
         with open(raw_path, 'r', encoding='utf-8') as f: raw_data = json.load(f)
             
         nodes = graph_data.get('nodes', [])
