@@ -21,6 +21,7 @@ from topology_validator import TopologyValidator
 from semantic_engine import SemanticEngine
 from space_engine import SpaceEngine
 from bim_core import BIMCoreEngine
+from p2_validation_pipeline import P2ValidationPipeline
 
 
 class TopologyHealthGateError(RuntimeError):
@@ -84,6 +85,7 @@ class RegressionTester:
         self.semantic_engine = SemanticEngine()
         self.space_engine = SpaceEngine()
         self.bim_core_engine = BIMCoreEngine()
+        self.p2_validation_pipeline = P2ValidationPipeline()
 
     def _build_topology_validation_report_path(self, filename: str) -> str:
         """Builds a per-project topology validation report path to avoid overwrites."""
@@ -94,6 +96,16 @@ class RegressionTester:
         """Builds a per-project topology health report path to avoid overwrites."""
         safe_name = os.path.splitext(os.path.basename(filename))[0]
         return self.path_manager.get_path("outputs", f"topology_health_{safe_name}.json")
+
+    def _build_canonical_validation_summary_path(self, filename: str) -> str:
+        """Builds a per-project canonical validation summary path to avoid overwrites."""
+        safe_name = os.path.splitext(os.path.basename(filename))[0]
+        return self.path_manager.get_path("outputs", f"p2_validation_summary_{safe_name}.json")
+
+    def _build_canonical_validation_report_path(self, filename: str) -> str:
+        """Builds a per-project canonical validation markdown path to avoid overwrites."""
+        safe_name = os.path.splitext(os.path.basename(filename))[0]
+        return self.path_manager.get_path("outputs", f"P2_Validation_Report_{safe_name}.md")
 
     def _load_topology_validation_summary(self, report_path: str) -> Dict[str, Any]:
         """Loads a compact summary from the topology validation JSON report."""
@@ -178,6 +190,21 @@ class RegressionTester:
             "counts": data.get("counts", {}),
         }
 
+    def _load_canonical_validation_summary(self, report_path: str) -> Dict[str, Any]:
+        """Loads the canonical validation summary JSON report if present."""
+        if not os.path.exists(report_path):
+            return {
+                "pipeline_version": "UNKNOWN",
+                "summary": {
+                    "validation_mode": "MISSING",
+                    "validation_passed": False,
+                    "quality_grade": "MISSING_REPORT",
+                },
+            }
+
+        with open(report_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
     def _evaluate_topology_health_gate(self, summary: Dict[str, Any]) -> Dict[str, Any]:
         """Evaluates whether topology diagnostics meet the fully-healthy visibility threshold."""
         actual_status = summary.get("status", "UNKNOWN")
@@ -222,6 +249,26 @@ class RegressionTester:
             return f"❌ CRITICAL ({components}c/{dangling}d/{degree_mismatches}dm)"
         return f"⚪ {status}"
 
+    def _format_canonical_validation_markdown_cell(self, project_report: Dict[str, Any]) -> str:
+        """Formats canonical validation visibility for the Markdown validation matrix."""
+        canonical = project_report.get("steps", {}).get("canonical_validation", {})
+        summary = canonical.get("validation_summary", {})
+        mode = summary.get("validation_mode", "N/A")
+        passed = summary.get("validation_passed")
+        status = canonical.get("status", "N/A")
+
+        if status == "SUCCESS" and passed is True:
+            return f"✅ PASS ({mode})"
+        if status == "FAILURE":
+            return f"❌ FAIL ({mode})"
+        return f"⚪ {status}"
+
+    def _format_metric_percentage(self, value: Any) -> str:
+        """Formats regression metric percentages while preserving unknown / unsupported states."""
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return f"{value:.0f}%"
+        return "N/A"
+
     def run_on_file(self, filepath: str) -> Dict[str, Any]:
         """Runs the entire end-to-end pipeline on a single DXF file and collects stats."""
         filename = os.path.basename(filepath)
@@ -240,9 +287,9 @@ class RegressionTester:
                 "topology_accuracy": 0.0,
                 "semantic_accuracy": 0.0,
                 "space_accuracy": 0.0,
-                "bim_accuracy": 0.0,
-                "3d_accuracy": 0.0,
-                "ifc_accuracy": 0.0
+                "bim_accuracy": None,
+                "3d_accuracy": None,
+                "ifc_accuracy": None
             },
             "counts": {}
         }
@@ -382,10 +429,57 @@ class RegressionTester:
             self.logger.info("  Step 6: BIM Core Engine...")
             bim_model = self.bim_core_engine.run(graph_data=resolved_graph)
             elapsed = int((time.time() - s_time) * 1000)
-            report["steps"]["core"] = {"status": "SUCCESS", "time_ms": elapsed}
-            report["metrics"]["bim_accuracy"] = 100.0
-            report["metrics"]["3d_accuracy"] = 100.0
-            report["metrics"]["ifc_accuracy"] = 100.0
+            report["steps"]["core"] = {
+                "status": "SUCCESS",
+                "time_ms": elapsed,
+                "canonical_bim_sha256": (bim_model or {}).get("provenance", {}).get("canonical_bim_sha256"),
+            }
+
+            # Step 6b: Canonical BIM Validation (Mandatory Blocking Gate)
+            s_time = time.time()
+            self.logger.info("  Step 6b: P2 Canonical BIM Validation...")
+            canonical_validation_summary_path = self._build_canonical_validation_summary_path(filename)
+            canonical_validation_report_path = self._build_canonical_validation_report_path(filename)
+            validation_summary = None
+            try:
+                validation_summary = self.p2_validation_pipeline.run_validation(
+                    bim_model_path=self.path_manager.get_path("outputs", "bim_model.json"),
+                    ground_truth_path=None,
+                    output_json_path=canonical_validation_summary_path,
+                    output_report_path=canonical_validation_report_path,
+                )
+                compact_summary = validation_summary.get("summary", {})
+                elapsed_validation = int((time.time() - s_time) * 1000)
+                report["steps"]["canonical_validation"] = {
+                    "status": "SUCCESS" if compact_summary.get("validation_passed") else "FAILURE",
+                    "time_ms": elapsed_validation,
+                    "validation_summary_json": self.path_manager.get_relative_path(canonical_validation_summary_path),
+                    "validation_report_md": self.path_manager.get_relative_path(canonical_validation_report_path),
+                    "validation_summary": compact_summary,
+                }
+
+                if not compact_summary.get("validation_passed", False):
+                    report["error_step"] = "canonical_validation"
+                    raise RuntimeError(
+                        "Canonical BIM validation failed: structural contract rejected outputs/bim_model.json."
+                    )
+            except Exception:
+                elapsed_validation = int((time.time() - s_time) * 1000)
+                if validation_summary is None:
+                    validation_summary = self._load_canonical_validation_summary(
+                        canonical_validation_summary_path
+                    )
+                compact_summary = validation_summary.get("summary", {})
+                canonical_step = report["steps"].setdefault("canonical_validation", {})
+                canonical_step.update({
+                    "status": "FAILURE",
+                    "time_ms": elapsed_validation,
+                    "validation_summary_json": self.path_manager.get_relative_path(canonical_validation_summary_path),
+                    "validation_report_md": self.path_manager.get_relative_path(canonical_validation_report_path),
+                    "validation_summary": compact_summary,
+                })
+                report["error_step"] = "canonical_validation"
+                raise
             
         except Exception as e:
             report["status"] = "FAILURE"
@@ -611,7 +705,7 @@ class RegressionTester:
             f"\n**Rapor Tarihi:** {stats['timestamp']}",
             f"**Platform Versiyonu:** `{stats['version']}`",
             "\n> **KAPSAM VE YÖNETİCİ BİLDİRİMİ (SCOPE & DISCLAIMER):**",
-            f"> Rapor içerisinde sunulan **%100 başarı** ve **%100 determinizm** metrikleri **YALNIZCA MEVCUT REFERANS VERİ SETİ ({stats['total_projects_tested']} ADET DXF PROJESİ)** için geçerlidir. Tüm dış CAD ve DXF girdi uzayı için genel bir garanti teşkil etmez.",
+            f"> Rapor içerisinde sunulan başarı, determinizm ve doğrulama görünürlüğü metrikleri **YALNIZCA MEVCUT REFERANS VERİ SETİ ({stats['total_projects_tested']} ADET DXF PROJESİ)** için geçerlidir. Tüm dış CAD ve DXF girdi uzayı için genel bir garanti teşkil etmez.",
             "\n## 1. Test Ortamı ve Donanım Konfigürasyonu (Environment Specs)",
             "| Parametre | Değer |",
             "|---|---|",
@@ -630,17 +724,22 @@ class RegressionTester:
             f"- **Toplam İşlem Süresi:** {stats['total_execution_time_ms'] / 1000:.3f} saniye",
             f"- **Proje Başına Ortalama Süre:** {stats['average_execution_time_ms']:.1f} ms",
             "\n## 4. Proje Bazlı Detaylı Doğrulama Tablosu (Validation Matrix)",
-            "| No | Proje Adı | Parser | Geometry | Topology | Topo Validation | Semantic | Space | BIM | 3D | IFC | Durum | Süre (ms) |",
-            "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+            "| No | Proje Adı | Parser | Geometry | Topology | Topo Validation | Canonical Validation | Semantic | Space | BIM | 3D | IFC | Durum | Süre (ms) |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
         ]
         
         for idx, p in enumerate(stats["projects"], 1):
             m = p["metrics"]
             status_symbol = "✅ SUCCESS" if p["status"] == "SUCCESS" else "❌ FAILED"
             topo_validation = self._format_topology_validation_markdown_cell(p)
+            canonical_validation = self._format_canonical_validation_markdown_cell(p)
             md_lines.append(
-                f"| {idx:02d} | `{p['file']}` | {m['parser_success']:.0f}% | {m['geometry_accuracy']:.0f}% | {m['topology_accuracy']:.0f}% | {topo_validation} | {m['semantic_accuracy']:.0f}% | {m['space_accuracy']:.0f}% | {m['bim_accuracy']:.0f}% | {m['3d_accuracy']:.0f}% | {m['ifc_accuracy']:.0f}% | **{status_symbol}** | {p['total_time_ms']} |"
+                f"| {idx:02d} | `{p['file']}` | {self._format_metric_percentage(m['parser_success'])} | {self._format_metric_percentage(m['geometry_accuracy'])} | {self._format_metric_percentage(m['topology_accuracy'])} | {topo_validation} | {canonical_validation} | {self._format_metric_percentage(m['semantic_accuracy'])} | {self._format_metric_percentage(m['space_accuracy'])} | {self._format_metric_percentage(m['bim_accuracy'])} | {self._format_metric_percentage(m['3d_accuracy'])} | {self._format_metric_percentage(m['ifc_accuracy'])} | **{status_symbol}** | {p['total_time_ms']} |"
             )
+
+        md_lines.append(
+            "\n> **Not:** `BIM / 3D / IFC` sütunları bağımsız ground-truth benchmark olmadan raporlanmaz; desteklenmeyen başarı yüzdeleri yerine `N/A` gösterilir."
+        )
             
         md_lines.extend([
             "\n## 5. Katman ve Nesne Analiz Dağılımı",
@@ -679,6 +778,19 @@ class RegressionTester:
             md_lines.append(
                 f"| {idx:02d} | `{p['file']}` | {self._format_topology_health_markdown_cell(p)} | {summary.get('connected_components', 0)} | {summary.get('dangling_node_count', 0)} | {summary.get('self_loop_edge_count', 0)} | `{constraint.get('topology_health_report', '-')}` |"
             )
+
+        md_lines.extend([
+            "\n## 5d. Canonical BIM Validation Raporları",
+            "| No | Proje Adı | Validation Mode | Validation Passed | Quality Grade | Summary JSON | Report MD |",
+            "|---|---|---|---|---|---|---|",
+        ])
+
+        for idx, p in enumerate(stats["projects"], 1):
+            canonical = p.get("steps", {}).get("canonical_validation", {})
+            summary = canonical.get("validation_summary", {})
+            md_lines.append(
+                f"| {idx:02d} | `{p['file']}` | `{summary.get('validation_mode', 'N/A')}` | `{summary.get('validation_passed', 'N/A')}` | `{summary.get('quality_grade', 'N/A')}` | `{canonical.get('validation_summary_json', '-')}` | `{canonical.get('validation_report_md', '-')}` |"
+            )
             
         md_lines.extend([
             "\n## 6. Geometry & Topology Engine Benchmark Metrikleri",
@@ -711,7 +823,7 @@ class RegressionTester:
             "\n## 8. Stabilizasyon & Hata Analizi (Root Cause Analysis)",
             "- **Collinear Merge Geliştirmesi:** Duvar birleştirme algoritmasındaki hassasiyet ayarlanarak, üst üste binen veya ardışık kolineer çizgiler tam bir bütün haline getirilmiştir. Bu durum, topoloji motorundaki T ve X tipi birleşim hatalarını tamamen sıfırlamıştır.",
             "- **Dangling Node Tolerans Aralığı:** Sık karşılaşılan açık uçlu duvar (leakage) hataları, `space_engine` içindeki dinamik sınır kapama algoritmasıyla sızdırmaz hale getirilmiş, böylece tüm kapalı mahal (Room) sınırları firesiz bir şekilde çıkartılmıştır.",
-            "- **BIM Core Standardizasyonu:** Geliştirilen test ve entegrasyon şemaları ile, tüm CAD katmanlarındaki veriler (duvarlar, pencereler, kolonlar ve odalar) tek bir ortak JSON şeması (`bim_model.json`) altında toplanmıştır. Bu durum downstream 3D ve IFC çıktı kalitesini garanti altına almaktadır.",
+            "- **BIM Core Standardizasyonu:** Geliştirilen test ve entegrasyon şemaları ile, tüm CAD katmanlarındaki veriler (duvarlar, pencereler, kolonlar ve odalar) tek bir ortak JSON şeması (`bim_model.json`) altında toplanmıştır. Bu durum downstream tüketiciler için tekil ve doğrulanabilir bir Canonical BIM girişi sağlar.",
             "\n---",
             "\n**Sonuç:** KaRar v1.0 Release Candidate 1 (RC1) çekirdek mimari pipeline'ı, test edilen 20 referans proje ve sentetik edge-case stres testlerinde **kararlı ve ölçülebilir performans** göstermiştir. *(Başarı ve determinizm metrikleri yalnızca test edilen 20 DXF referans kümesi ve sentetik benchmark senaryoları için doğrulanmıştır.)*"
         ])

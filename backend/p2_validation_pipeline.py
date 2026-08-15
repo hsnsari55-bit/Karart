@@ -52,11 +52,13 @@ class P2ValidationPipeline:
         # Compute SHA-256 seal of the Canonical BIM SSoT input
         ssot_sha256 = hashlib.sha256(bim_content.encode("utf-8")).hexdigest()
 
-        if ground_truth_path and os.path.exists(ground_truth_path):
+        has_independent_ground_truth = bool(ground_truth_path and os.path.exists(ground_truth_path))
+
+        if has_independent_ground_truth:
             with open(ground_truth_path, "r", encoding="utf-8") as f:
                 gt_data = json.load(f)
         else:
-            # Self-verifying gold-standard benchmark against BIM SSoT contract
+            # Structural contract audit mode: metrics remain visible but are self-referential.
             gt_data = bim_data
 
         # Execute Layer 1 - Layer 5 Strict Quality Gate Audits
@@ -94,12 +96,34 @@ class P2ValidationPipeline:
         pass_wall_f1 = overall_f1 >= 0.985
         pass_room_iou = room_iou >= 0.990
         pass_opening_acc = opening_acc >= 0.995
-        overall_pass = pass_layer_audits and pass_wall_f1 and pass_room_iou and pass_opening_acc
+        benchmark_validation_passed = pass_wall_f1 and pass_room_iou and pass_opening_acc
+        validation_mode = "GROUND_TRUTH_BENCHMARK" if has_independent_ground_truth else "STRUCTURAL_AUDIT_ONLY"
+        benchmark_evidence = (
+            "INDEPENDENT_GROUND_TRUTH"
+            if has_independent_ground_truth
+            else "SELF_REFERENTIAL_INTERNAL_COMPARISON"
+        )
+        validation_passed = (
+            pass_layer_audits and benchmark_validation_passed
+            if has_independent_ground_truth
+            else pass_layer_audits
+        )
+
+        if not pass_layer_audits:
+            quality_grade = "REJECTED_INVALID_SSOT"
+        elif has_independent_ground_truth and benchmark_validation_passed:
+            quality_grade = "CLASS_A_EXCELLENT"
+        elif has_independent_ground_truth:
+            quality_grade = "REJECTED_BELOW_BENCHMARK_THRESHOLD"
+        else:
+            quality_grade = "CLASS_B_STRUCTURALLY_VALIDATED"
 
         validation_summary = {
             "pipeline_version": "v1.0.0-P2-RC1",
             "ssot_input_sha256": ssot_sha256,
             "deterministic_execution": True,
+            "validation_mode": validation_mode,
+            "benchmark_evidence": benchmark_evidence,
             "layer_audits": {
                 "layer1_schema": layer1_schema,
                 "layer2_uuids_and_references": layer2_uuid,
@@ -115,6 +139,14 @@ class P2ValidationPipeline:
                 "min_opening_accuracy": 0.995
             },
             "summary": {
+                "validation_mode": validation_mode,
+                "benchmark_evidence": benchmark_evidence,
+                "independent_ground_truth_provided": has_independent_ground_truth,
+                "benchmark_thresholds_applied": has_independent_ground_truth,
+                "structural_validation_passed": pass_layer_audits,
+                "benchmark_validation_passed": (
+                    benchmark_validation_passed if has_independent_ground_truth else None
+                ),
                 "layer_audits_passed": pass_layer_audits,
                 "wall_precision": wall_metrics["precision"],
                 "wall_recall": wall_metrics["recall"],
@@ -124,8 +156,8 @@ class P2ValidationPipeline:
                 "opening_accuracy": opening_metrics["association_accuracy"],
                 "orphan_references_count": layer2_uuid["orphan_references_count"],
                 "semantic_violations_count": layer4_semantics["violations_count"],
-                "quality_grade": "CLASS_A_EXCELLENT" if overall_pass else ("CLASS_B_VERIFIED" if pass_layer_audits else "REJECTED_INVALID_SSOT"),
-                "validation_passed": overall_pass
+                "quality_grade": quality_grade,
+                "validation_passed": validation_passed
             }
         }
 
@@ -191,12 +223,18 @@ class P2ValidationPipeline:
 
     def _evaluate_spaces(self, ext_spaces: List[Dict], gt_spaces: List[Dict]) -> Dict[str, Any]:
         """Calculates Room Polygon IoU (Intersection over Union) and Closure Rate."""
-        if not gt_spaces:
-            return {"mean_iou": 1.0 if not ext_spaces else 0.0, "closure_rate": 1.0}
-
-        ious = []
         valid_closed = sum(1 for s in ext_spaces if (s.get("area", 0) > 0.1 or s.get("area_m2", 0) > 0.1 or len(s.get("boundary", [])) >= 3))
         closure_rate = valid_closed / max(1, len(ext_spaces))
+
+        if not gt_spaces:
+            return {
+                "extracted_spaces_count": len(ext_spaces),
+                "ground_truth_spaces_count": len(gt_spaces),
+                "closure_rate": round(closure_rate if ext_spaces else 1.0, 4),
+                "mean_iou": round(1.0 if not ext_spaces else 0.0, 4)
+            }
+
+        ious = []
 
         for es in ext_spaces:
             a_e = es.get("area", 0) or es.get("area_m2", 0) or 1.0
@@ -222,7 +260,7 @@ class P2ValidationPipeline:
 
     def _audit_layer1_schema(self, bim_data: Dict[str, Any]) -> Dict[str, Any]:
         """Layer 1: Schema & Mandatory Structural Root Keys Validation."""
-        required_root_keys = ["spaces", "walls", "windows", "columns", "doors", "metadata"]
+        required_root_keys = ["spaces", "walls", "windows", "columns", "doors", "metadata", "provenance"]
         missing_keys = [k for k in required_root_keys if k not in bim_data]
         has_provenance = "provenance" in bim_data
         
@@ -234,55 +272,85 @@ class P2ValidationPipeline:
         }
 
     def _audit_layer2_uuids_and_references(self, bim_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Layer 2: UUID Uniqueness & Orphan Reference Detection."""
+        """Layer 2: UUID Uniqueness, Mandatory UUID Presence & Typed Reference Detection."""
         all_uuids = set()
         duplicate_uuids = []
+        missing_entity_uuids = []
         
         # Collect all entity UUIDs
         categories = ["spaces", "walls", "windows", "columns", "doors"]
+        category_uuid_map = {cat: set() for cat in categories}
         for cat in categories:
-            for item in bim_data.get(cat, []):
+            for idx, item in enumerate(bim_data.get(cat, [])):
                 u = item.get("uuid")
                 if not u:
+                    missing_entity_uuids.append({
+                        "category": cat,
+                        "index": idx,
+                        "entity_type": item.get("type")
+                    })
                     continue
                 if u in all_uuids:
                     duplicate_uuids.append(u)
                 else:
                     all_uuids.add(u)
+                category_uuid_map[cat].add(u)
 
         orphan_references = []
+        type_mismatch_references = []
+
+        def _audit_typed_reference(source_uuid: Any, ref_type: str, target_uuid: Any, expected_category: str):
+            if target_uuid not in all_uuids:
+                orphan_references.append({
+                    "source": source_uuid,
+                    "type": ref_type,
+                    "target": target_uuid
+                })
+                return
+
+            if target_uuid not in category_uuid_map[expected_category]:
+                type_mismatch_references.append({
+                    "source": source_uuid,
+                    "type": ref_type,
+                    "target": target_uuid,
+                    "expected_category": expected_category
+                })
         
         # Audit space references
         for sp in bim_data.get("spaces", []):
             sp_uuid = sp.get("uuid")
             for wall_ref in sp.get("related_walls", []):
-                if wall_ref not in all_uuids:
-                    orphan_references.append({"source": sp_uuid, "type": "Space->Wall", "target": wall_ref})
+                _audit_typed_reference(sp_uuid, "Space->Wall", wall_ref, "walls")
             for win_ref in sp.get("related_windows", []):
-                if win_ref not in all_uuids:
-                    orphan_references.append({"source": sp_uuid, "type": "Space->Window", "target": win_ref})
+                _audit_typed_reference(sp_uuid, "Space->Window", win_ref, "windows")
             for dr_ref in sp.get("related_doors", []):
-                if dr_ref not in all_uuids:
-                    orphan_references.append({"source": sp_uuid, "type": "Space->Door", "target": dr_ref})
+                _audit_typed_reference(sp_uuid, "Space->Door", dr_ref, "doors")
             for col_ref in sp.get("related_columns", []):
-                if col_ref not in all_uuids:
-                    orphan_references.append({"source": sp_uuid, "type": "Space->Column", "target": col_ref})
+                _audit_typed_reference(sp_uuid, "Space->Column", col_ref, "columns")
             for neighbor_ref in sp.get("neighbors", []):
-                if neighbor_ref not in all_uuids:
-                    orphan_references.append({"source": sp_uuid, "type": "Space->NeighborSpace", "target": neighbor_ref})
+                _audit_typed_reference(sp_uuid, "Space->NeighborSpace", neighbor_ref, "spaces")
 
         # Audit opening parent wall references
         for el in bim_data.get("windows", []) + bim_data.get("doors", []):
             pw = el.get("parent_wall")
-            if pw and pw not in all_uuids:
-                orphan_references.append({"source": el.get("uuid"), "type": "Opening->ParentWall", "target": pw})
+            if pw:
+                _audit_typed_reference(el.get("uuid"), "Opening->ParentWall", pw, "walls")
 
-        passed = (len(duplicate_uuids) == 0 and len(orphan_references) == 0)
+        passed = (
+            len(duplicate_uuids) == 0 and
+            len(missing_entity_uuids) == 0 and
+            len(orphan_references) == 0 and
+            len(type_mismatch_references) == 0
+        )
         return {
             "passed": passed,
             "duplicate_uuids_count": len(duplicate_uuids),
+            "missing_entity_uuid_count": len(missing_entity_uuids),
+            "missing_entity_uuid_details": missing_entity_uuids[:5],
             "orphan_references_count": len(orphan_references),
-            "orphan_details": orphan_references[:5]
+            "orphan_details": orphan_references[:5],
+            "type_mismatch_references_count": len(type_mismatch_references),
+            "type_mismatch_details": type_mismatch_references[:5]
         }
 
     def _audit_layer3_topology_and_graph(self, bim_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -342,14 +410,19 @@ class P2ValidationPipeline:
 
     def _evaluate_openings(self, ext_openings: List[Dict], gt_openings: List[Dict]) -> Dict[str, Any]:
         """Calculates Opening (Door/Window) Ownership and Association Accuracy."""
-        if not gt_openings:
-            return {"association_accuracy": 1.0}
-
         correct_associations = 0
         for eo in ext_openings:
             e_wall = eo.get("parent_wall") or eo.get("host_wall_uuid") or eo.get("geometry") or eo.get("type")
             if e_wall:
                 correct_associations += 1
+
+        if not gt_openings:
+            accuracy = correct_associations / max(1, len(ext_openings)) if ext_openings else 1.0
+            return {
+                "total_openings": len(ext_openings),
+                "correctly_associated": correct_associations,
+                "association_accuracy": round(accuracy, 4)
+            }
 
         accuracy = correct_associations / max(1, len(ext_openings)) if ext_openings else 1.0
 
@@ -384,13 +457,30 @@ class P2ValidationPipeline:
         l3 = audits.get("layer3_topology_and_graph", {})
         l4 = audits.get("layer4_semantic_invariants", {})
 
-        md_content = f"""# KaRar AI - P2 Ground Truth Validation Report
+        benchmark_thresholds_applied = s.get("benchmark_thresholds_applied", False)
+        wall_status = "N/A (self-reference)" if not benchmark_thresholds_applied else ("PASS" if s["wall_f1_score"] >= 0.985 else "FAIL")
+        room_status = "N/A (self-reference)" if not benchmark_thresholds_applied else ("PASS" if s["room_mean_iou"] >= 0.990 else "FAIL")
+        opening_status = "N/A (self-reference)" if not benchmark_thresholds_applied else ("PASS" if s["opening_accuracy"] >= 0.995 else "FAIL")
+        benchmark_note = (
+            "> **Not:** Bağımsız ground truth sağlanmadı. Aşağıdaki wall / room / opening metrikleri self-referential contract diagnostics'tir ve bağımsız doğruluk kanıtı olarak yorumlanmamalıdır."
+            if not benchmark_thresholds_applied
+            else "> **Not:** Aşağıdaki benchmark metrikleri bağımsız ground truth girdisine karşı hesaplandı."
+        )
 
-**Pipeline Version:** {summary["pipeline_version"]}  
-**SSoT Input Hash (SHA-256):** `{summary["ssot_input_sha256"]}`  
-**Validation Seal (SHA-256):** `{summary["validation_seal_sha256"]}`  
-**Validation Status:** **{'PASSED' if s['validation_passed'] else 'FAILED'}**  
-**Quality Grade:** `{s['quality_grade']}`  
+        md_content = f"""# KaRar AI - P2 Canonical Validation Report
+
+**Pipeline Version:** {summary["pipeline_version"]}
+**SSoT Input Hash (SHA-256):** `{summary["ssot_input_sha256"]}`
+**Validation Seal (SHA-256):** `{summary["validation_seal_sha256"]}`
+**Validation Mode:** `{s.get('validation_mode', 'UNKNOWN')}`
+**Benchmark Evidence:** `{s.get('benchmark_evidence', 'UNKNOWN')}`
+**Independent Ground Truth Provided:** **{'YES' if s.get('independent_ground_truth_provided') else 'NO'}**
+**Validation Status:** **{'PASSED' if s['validation_passed'] else 'FAILED'}**
+**Quality Grade:** `{s['quality_grade']}`
+
+---
+
+{benchmark_note}
 
 ---
 
@@ -399,22 +489,22 @@ class P2ValidationPipeline:
 | Audit Layer | Audit Name | Result | Key Findings |
 | :--- | :--- | :--- | :--- |
 | **Layer 1** | Schema & Root Keys | {'PASS' if l1.get('passed') else 'FAIL'} | Missing keys: `{l1.get('missing_root_keys', [])}` |
-| **Layer 2** | UUID & Reference Integrity | {'PASS' if l2.get('passed') else 'FAIL'} | Orphans: `{l2.get('orphan_references_count', 0)}`, Duplicates: `{l2.get('duplicate_uuids_count', 0)}` |
+| **Layer 2** | UUID & Reference Integrity | {'PASS' if l2.get('passed') else 'FAIL'} | Orphans: `{l2.get('orphan_references_count', 0)}`, Duplicates: `{l2.get('duplicate_uuids_count', 0)}`, Missing UUID: `{l2.get('missing_entity_uuid_count', 0)}`, Type Mismatch: `{l2.get('type_mismatch_references_count', 0)}` |
 | **Layer 3** | Spatial Topology & Graph | {'PASS' if l3.get('passed') else 'FAIL'} | Open Polygons: `{l3.get('open_space_polygons', 0)}`, Degenerate Walls: `{l3.get('degenerate_walls', 0)}` |
 | **Layer 4** | Semantic Invariants | {'PASS' if l4.get('passed') else 'FAIL'} | Semantic Violations: `{l4.get('violations_count', 0)}` |
 
 ---
 
-## 2. Summary of Benchmark Metrics
+## 2. Summary of Contract Diagnostics & Benchmark Metrics
 
 | Metric | Target Threshold | Measured Value | Status |
 | :--- | :--- | :--- | :--- |
-| **Wall $F_1$ Score** | $\ge 0.9850$ | `{s['wall_f1_score']:.4f}` | {'PASS' if s['wall_f1_score'] >= 0.985 else 'FAIL'} |
+| **Wall $F_1$ Score** | ≥ 0.9850 | `{s['wall_f1_score']:.4f}` | {wall_status} |
 | **Wall Precision** | N/A | `{s['wall_precision']:.4f}` | OK |
 | **Wall Recall** | N/A | `{s['wall_recall']:.4f}` | OK |
-| **Room Polygon Mean IoU** | $\ge 0.9900$ | `{s['room_mean_iou']:.4f}` | {'PASS' if s['room_mean_iou'] >= 0.990 else 'FAIL'} |
+| **Room Polygon Mean IoU** | ≥ 0.9900 | `{s['room_mean_iou']:.4f}` | {room_status} |
 | **Room Closure Rate** | N/A | `{s['room_closure_rate']:.4f}` | OK |
-| **Opening Association Acc.** | $\ge 0.9950$ | `{s['opening_accuracy']:.4f}` | {'PASS' if s['opening_accuracy'] >= 0.995 else 'FAIL'} |
+| **Opening Association Acc.** | ≥ 0.9950 | `{s['opening_accuracy']:.4f}` | {opening_status} |
 
 ---
 
@@ -444,6 +534,7 @@ class P2ValidationPipeline:
 - **Read-Only SSoT:** Ensured. `bim_model.json` was processed without mutation.
 - **One-Way Data Flow:** Ensured (`Canonical BIM -> Validation Pipeline`).
 - **Deterministic Seal:** Lock verified via SHA-256 hash.
+- **Structural vs Benchmark Separation:** {'Independent benchmark thresholds applied.' if benchmark_thresholds_applied else 'Ground-truth benchmark thresholds were not applied; structural audit semantics remain authoritative.'}
 """
         os.makedirs(os.path.dirname(report_path), exist_ok=True)
         with open(report_path, "w", encoding="utf-8") as f:

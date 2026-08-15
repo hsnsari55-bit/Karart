@@ -10,6 +10,9 @@ import shapely
 
 from backend.path_manager import PathManager
 
+
+DOMAIN_HASH_SPEC_VERSION = "1.0"
+
 class BIMCoreEngine:
     def __init__(self):
         self.path_manager = PathManager()
@@ -53,6 +56,16 @@ class BIMCoreEngine:
 
         return None
 
+    def _resolve_space_wall_reference(self, wall_ref, wall_ref_to_uuid):
+        """Resolve space boundary wall references to canonical wall UUID."""
+        if wall_ref is None:
+            return None
+
+        resolved = wall_ref_to_uuid.get(wall_ref)
+        if resolved is None:
+            resolved = wall_ref_to_uuid.get(str(wall_ref))
+        return resolved
+
     def _get_element_points(self, element):
         points = element.get('points')
         if points is not None:
@@ -81,6 +94,21 @@ class BIMCoreEngine:
     def _hash_graph_data(self, graph_data):
         payload = json.dumps(graph_data, sort_keys=True, ensure_ascii=True).encode('utf-8')
         return hashlib.sha256(payload).hexdigest()
+
+    def _build_domain_hash_payload(self, canonical_model):
+        return {
+            "domain_hash_spec": DOMAIN_HASH_SPEC_VERSION,
+            "spaces": canonical_model.get("spaces", []),
+            "walls": canonical_model.get("walls", []),
+            "windows": canonical_model.get("windows", []),
+            "columns": canonical_model.get("columns", []),
+            "doors": canonical_model.get("doors", []),
+        }
+
+    def _calculate_domain_content_hash(self, canonical_model):
+        domain_payload = self._build_domain_hash_payload(canonical_model)
+        json_bytes = json.dumps(domain_payload, indent=4, sort_keys=True).replace('\r\n', '\n').encode('utf-8')
+        return hashlib.sha256(json_bytes).hexdigest()
 
     def run(self, graph_data=None):
         bim_path = self.path_manager.get_path('outputs', 'bim_semantics.json')
@@ -178,6 +206,17 @@ class BIMCoreEngine:
         for sp in spaces:
             for e_idx in sp.get('edge_indices', []):
                 wall_uuid = edge_idx_to_wall_uuid.get(e_idx)
+                if wall_uuid:
+                    if wall_uuid not in sp['related_walls']:
+                        sp['related_walls'].append(wall_uuid)
+                    if sp['uuid'] not in wall_to_spaces[wall_uuid]:
+                        wall_to_spaces[wall_uuid].append(sp['uuid'])
+
+            if sp['related_walls']:
+                continue
+
+            for wall_ref in sp.get('bounded_by_walls', []):
+                wall_uuid = self._resolve_space_wall_reference(wall_ref, wall_ref_to_uuid)
                 if wall_uuid:
                     if wall_uuid not in sp['related_walls']:
                         sp['related_walls'].append(wall_uuid)
@@ -291,6 +330,7 @@ class BIMCoreEngine:
             "engine": "KaRar BIM Core",
             "engine_version": "v1.0.0-RC1",
             "schema_version": "1.0",
+            "domain_hash_spec": DOMAIN_HASH_SPEC_VERSION,
             "python_version": sys.version.split()[0],
             "shapely_version": getattr(shapely, '__version__', 'unknown'),
             "generated_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
@@ -314,16 +354,15 @@ class BIMCoreEngine:
             "doors": doors
         }
 
-        output_bytes = json.dumps(canonical_model, indent=4, sort_keys=True).encode('utf-8')
-        canonical_sha256 = hashlib.sha256(output_bytes).hexdigest()
-        canonical_model["provenance"]["canonical_bim_sha256"] = canonical_sha256
+        domain_content_sha256 = self._calculate_domain_content_hash(canonical_model)
+        canonical_model["provenance"]["canonical_bim_sha256"] = domain_content_sha256
 
         output_path = self.path_manager.get_path('outputs', 'bim_model.json')
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, 'wb') as f:
             f.write(json.dumps(canonical_model, indent=4, sort_keys=True).encode('utf-8'))
             
-        self.logger.info(f"Canonical BIM Model generated with {len(spaces)} spaces, {len(walls)} walls, {len(windows)} windows. SHA-256: {canonical_sha256[:12]}")
+        self.logger.info(f"Canonical BIM Model generated with {len(spaces)} spaces, {len(walls)} walls, {len(windows)} windows. Domain SHA-256: {domain_content_sha256[:12]}")
         return canonical_model
 
 if __name__ == '__main__':
