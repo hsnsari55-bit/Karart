@@ -1196,6 +1196,14 @@ class TestModernPipeline(unittest.TestCase):
             self.assertEqual(len(run["canonical_model"]["spaces"]), 1)
             self.assertEqual(len(run["canonical_model"]["walls"]), 4)
             self.assertEqual(len(run["canonical_model"]["doors"]), 1)
+            self.assertEqual(
+                sorted(run["canonical_model"]["spaces"][0]["related_walls"]),
+                sorted(run["spaces"]["spaces"][0]["bounded_by_walls"]),
+            )
+            self.assertEqual(
+                sorted(run["persisted_bim_model"]["spaces"][0]["related_walls"]),
+                sorted(run["persisted_spaces"]["spaces"][0]["bounded_by_walls"]),
+            )
 
             door = run["canonical_model"]["doors"][0]
             self.assertIsNotNone(door.get("parent_wall"))

@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 import hashlib
 
@@ -28,6 +29,30 @@ class _StubSemanticPathManager(_StubPathManager):
 def _canonical_sha256(data) -> str:
     payload = json.dumps(data, sort_keys=True, ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+DOMAIN_HASH_SPEC_VERSION = "1.0"
+
+
+def _domain_hash_v1(bim_model) -> str:
+    payload = {
+        "domain_hash_spec": DOMAIN_HASH_SPEC_VERSION,
+        "spaces": bim_model.get("spaces", []),
+        "walls": bim_model.get("walls", []),
+        "windows": bim_model.get("windows", []),
+        "columns": bim_model.get("columns", []),
+        "doors": bim_model.get("doors", []),
+    }
+    json_bytes = json.dumps(payload, indent=4, sort_keys=True).replace("\r\n", "\n").encode("utf-8")
+    return hashlib.sha256(json_bytes).hexdigest()
+
+
+def _strip_volatile_provenance_fields(model):
+    clone = json.loads(json.dumps(model))
+    provenance = clone.get("provenance", {})
+    for key in ("generated_at", "python_version", "shapely_version", "input_hashes", "canonical_bim_sha256"):
+        provenance.pop(key, None)
+    return clone
 
 
 class TestRegressionBIMCoreOpeningParentWall(unittest.TestCase):
@@ -188,6 +213,81 @@ class TestRegressionBIMCoreOpeningParentWall(unittest.TestCase):
             self.assertEqual(door["source_block_name"], "ROOM_BLOCK_A")
             self.assertEqual(wall["source_block_name"], "ROOM_BLOCK_A")
             self.assertIn(door["uuid"], space["related_doors"])
+
+    def test_space_bounded_by_walls_falls_back_to_related_wall_uuids_when_edge_indices_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            semantics_path = os.path.join(temp_dir, "bim_semantics.json")
+            spaces_path = os.path.join(temp_dir, "spaces.json")
+            graph_path = os.path.join(temp_dir, "geometry_graph.json")
+
+            with open(semantics_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "elements": [
+                            {
+                                "uuid": "wall-semantic-1",
+                                "type": "Wall",
+                                "geometry": {
+                                    "points": [[0.0, 0.0], [10.0, 0.0]],
+                                    "length": 10.0,
+                                },
+                            },
+                            {
+                                "uuid": "wall-semantic-2",
+                                "type": "Wall",
+                                "geometry": {
+                                    "points": [[10.0, 0.0], [10.0, 10.0]],
+                                    "length": 10.0,
+                                },
+                            },
+                        ]
+                    },
+                    f,
+                    indent=2,
+                )
+
+            with open(spaces_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "spaces": [
+                            {
+                                "space_id": "space_1",
+                                "name": "Salon",
+                                "area": 100.0,
+                                "boundary": [[0, 0], [10, 0], [10, 10], [0, 10]],
+                                "bounded_by_walls": ["wall-semantic-1", "wall-semantic-2"],
+                            }
+                        ]
+                    },
+                    f,
+                    indent=2,
+                )
+
+            with open(graph_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "nodes": [],
+                        "edges": [],
+                        "loops": [],
+                    },
+                    f,
+                    indent=2,
+                )
+
+            engine = BIMCoreEngine()
+            engine.path_manager = _StubPathManager(temp_dir)
+
+            canonical_model = engine.run()
+
+            self.assertEqual(len(canonical_model["walls"]), 2)
+            space = canonical_model["spaces"][0]
+
+            self.assertEqual(
+                sorted(space["related_walls"]),
+                ["wall-semantic-1", "wall-semantic-2"],
+            )
+            for wall in canonical_model["walls"]:
+                self.assertEqual(wall["related_spaces"], [space["uuid"]])
 
     def test_curved_opening_from_flattened_arc_keeps_wall_trace_and_is_classified(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -446,6 +546,96 @@ class TestRegressionBIMCoreOpeningParentWall(unittest.TestCase):
             self.assertNotEqual(
                 canonical_model["provenance"]["input_hashes"]["geometry_graph_sha256"],
                 raw_graph_sha256,
+            )
+
+    def test_domain_hash_excludes_volatile_provenance_and_registers_spec_version(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            semantics_path = os.path.join(temp_dir, "bim_semantics.json")
+            spaces_path = os.path.join(temp_dir, "spaces.json")
+            graph_path = os.path.join(temp_dir, "geometry_graph.json")
+
+            with open(semantics_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "elements": [
+                            {
+                                "element_id": "wall_1",
+                                "wall_id": 101,
+                                "type": "Wall",
+                                "points": [[0.0, 0.0], [10.0, 0.0]],
+                                "thickness": 250.0,
+                            },
+                            {
+                                "element_id": "door_1",
+                                "type": "Door",
+                                "points": [[2.0, 0.0], [3.0, 0.0]],
+                                "width": 900.0,
+                                "wall_id": 101,
+                            },
+                            {
+                                "element_id": "window_1",
+                                "type": "Window",
+                                "points": [[6.0, 0.0], [7.0, 0.0]],
+                                "width": 1200.0,
+                                "wall_id": 101,
+                            },
+                        ]
+                    },
+                    f,
+                    indent=2,
+                )
+
+            with open(spaces_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "spaces": [
+                            {
+                                "space_id": "space_1",
+                                "name": "Salon",
+                                "area": 100.0,
+                                "boundary": [[0, 0], [10, 0], [10, 10], [0, 10]],
+                                "edge_indices": [0],
+                                "element_indices": [],
+                            }
+                        ]
+                    },
+                    f,
+                    indent=2,
+                )
+
+            with open(graph_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "nodes": [
+                            {"id": 0, "x": 0.0, "y": 0.0},
+                            {"id": 1, "x": 10.0, "y": 0.0},
+                        ],
+                        "edges": [{"id": 1, "from": 0, "to": 1}],
+                        "loops": [],
+                    },
+                    f,
+                    indent=2,
+                )
+
+            engine = BIMCoreEngine()
+            engine.path_manager = _StubPathManager(temp_dir)
+
+            first_model = engine.run()
+            time.sleep(1.1)
+            second_model = engine.run()
+
+            self.assertNotEqual(first_model["provenance"]["generated_at"], second_model["provenance"]["generated_at"])
+            self.assertEqual(first_model["provenance"]["domain_hash_spec"], DOMAIN_HASH_SPEC_VERSION)
+            self.assertEqual(second_model["provenance"]["domain_hash_spec"], DOMAIN_HASH_SPEC_VERSION)
+            self.assertEqual(
+                first_model["provenance"]["canonical_bim_sha256"],
+                second_model["provenance"]["canonical_bim_sha256"],
+            )
+            self.assertEqual(first_model["provenance"]["canonical_bim_sha256"], _domain_hash_v1(first_model))
+            self.assertEqual(second_model["provenance"]["canonical_bim_sha256"], _domain_hash_v1(second_model))
+            self.assertEqual(
+                _strip_volatile_provenance_fields(first_model),
+                _strip_volatile_provenance_fields(second_model),
             )
 
 

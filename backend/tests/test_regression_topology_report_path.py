@@ -43,6 +43,15 @@ RegressionTester = regression_module.RegressionTester
 
 
 class TestRegressionTopologyReportPath(unittest.TestCase):
+    def test_build_canonical_validation_paths_are_per_project_and_relative_to_outputs(self):
+        tester = RegressionTester()
+
+        summary_path = tester._build_canonical_validation_summary_path("sample_plan.dxf")
+        report_path = tester._build_canonical_validation_report_path("sample_plan.dxf")
+
+        self.assertTrue(summary_path.endswith(os.path.join("outputs", "p2_validation_summary_sample_plan.json")))
+        self.assertTrue(report_path.endswith(os.path.join("outputs", "P2_Validation_Report_sample_plan.md")))
+
     def test_build_topology_validation_report_path_is_per_project_and_relative_to_outputs(self):
         tester = RegressionTester()
 
@@ -369,6 +378,20 @@ class TestRegressionTopologyReportPath(unittest.TestCase):
         tester.semantic_engine = _Semantic()
         tester.space_engine = _Space()
         tester.bim_core_engine = _BimCore()
+        tester.p2_validation_pipeline = types.SimpleNamespace(
+            run_validation=lambda **kwargs: {
+                "summary": {
+                    "validation_mode": "STRUCTURAL_AUDIT_ONLY",
+                    "benchmark_evidence": "SELF_REFERENTIAL_INTERNAL_COMPARISON",
+                    "independent_ground_truth_provided": False,
+                    "benchmark_thresholds_applied": False,
+                    "structural_validation_passed": True,
+                    "benchmark_validation_passed": None,
+                    "validation_passed": True,
+                    "quality_grade": "CLASS_B_STRUCTURALLY_VALIDATED",
+                }
+            }
+        )
         tester.path_manager = types.SimpleNamespace(
             get_relative_path=lambda path: path,
             get_path=lambda *parts: os.path.join(*parts),
@@ -547,6 +570,20 @@ class TestRegressionTopologyReportPath(unittest.TestCase):
         tester.semantic_engine = _Semantic()
         tester.space_engine = _Space()
         tester.bim_core_engine = _BimCore()
+        tester.p2_validation_pipeline = types.SimpleNamespace(
+            run_validation=lambda **kwargs: {
+                "summary": {
+                    "validation_mode": "STRUCTURAL_AUDIT_ONLY",
+                    "benchmark_evidence": "SELF_REFERENTIAL_INTERNAL_COMPARISON",
+                    "independent_ground_truth_provided": False,
+                    "benchmark_thresholds_applied": False,
+                    "structural_validation_passed": True,
+                    "benchmark_validation_passed": None,
+                    "validation_passed": True,
+                    "quality_grade": "CLASS_B_STRUCTURALLY_VALIDATED",
+                }
+            }
+        )
         tester.path_manager = types.SimpleNamespace(
             get_relative_path=lambda path: path,
             get_path=lambda *parts: os.path.join(*parts),
@@ -578,6 +615,189 @@ class TestRegressionTopologyReportPath(unittest.TestCase):
         self.assertIs(received_graphs["bim_core"], resolved_graph)
         self.assertIsNot(received_graphs["semantic"], topology_graph)
         self.assertEqual(received_graphs["semantic"]["edges"][0]["id"], 99)
+        self.assertEqual(report["steps"]["canonical_validation"]["status"], "SUCCESS")
+        self.assertEqual(
+            report["steps"]["canonical_validation"]["validation_summary"]["validation_mode"],
+            "STRUCTURAL_AUDIT_ONLY",
+        )
+        self.assertIsNone(report["metrics"]["bim_accuracy"])
+        self.assertIsNone(report["metrics"]["3d_accuracy"])
+        self.assertIsNone(report["metrics"]["ifc_accuracy"])
+
+    def test_run_on_file_blocks_invalid_canonical_bim_via_p2_validator(self):
+        tester = RegressionTester()
+
+        topology_graph = {
+            "nodes": [
+                {"id": 0, "x": 0.0, "y": 0.0, "degree": 2},
+                {"id": 1, "x": 10.0, "y": 0.0, "degree": 2},
+            ],
+            "edges": [{"id": 1, "from": 0, "to": 1, "length": 10.0}],
+            "loops": [],
+        }
+
+        class _Parser:
+            def parse(self, filepath):
+                return {"source": filepath}
+
+        class _Geometry:
+            stats = {"segments_in": 1, "segments_out": 1}
+
+            def run(self):
+                return [{"wall_id": 1}]
+
+        class _Topology:
+            stats = {"nodes": 2, "edges": 1, "loops": 0}
+
+            def run(self):
+                return topology_graph
+
+        class _ConstraintSolver:
+            def run(self, graph):
+                return graph
+
+        class _Semantic:
+            def run(self, graph_data=None):
+                return {"elements": []}
+
+        class _Space:
+            def run(self, graph_data=None):
+                return {"spaces": []}
+
+        class _BimCore:
+            def run(self, graph_data=None):
+                return {
+                    "metadata": {"version": "1.0"},
+                    "provenance": {"canonical_bim_sha256": "deadbeef"},
+                    "walls": [],
+                    "doors": [],
+                    "windows": [],
+                    "columns": [],
+                    "spaces": [],
+                }
+
+        class _HealthReporter:
+            def __init__(self, report_output_path):
+                self.report_output_path = report_output_path
+
+            def generate(self, graph):
+                with open(self.report_output_path, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "status": "HEALTHY",
+                            "counts": {"nodes": 2, "edges": 1, "loops": 0},
+                            "checks": {
+                                "has_nodes": True,
+                                "has_edges": True,
+                                "has_loops": True,
+                                "degree_metadata_consistency": True,
+                            },
+                            "graph_metrics": {
+                                "connected_components": 1,
+                                "component_sizes": [2],
+                                "component_size_histogram": {"2": 1},
+                                "dangling_node_count": 0,
+                                "dangling_node_component_indexes": [],
+                                "self_loop_edge_count": 0,
+                                "isolated_node_component_indexes": [],
+                                "degree_metadata_mismatches": [],
+                            },
+                            "diagnostics": [],
+                        },
+                        handle,
+                    )
+
+        class _Validator:
+            def __init__(self, report_output_path):
+                self.report_output_path = report_output_path
+
+            def validate(self, graph):
+                with open(self.report_output_path, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "status": "PASS",
+                            "counts": {"nodes": 2, "edges": 1, "loops": 0},
+                            "checks": {
+                                "non_empty_nodes": True,
+                                "non_empty_edges": True,
+                            },
+                        },
+                        handle,
+                    )
+
+        class _P2Validator:
+            def __init__(self):
+                self.calls = []
+
+            def run_validation(self, **kwargs):
+                self.calls.append(kwargs)
+                return {
+                    "summary": {
+                        "validation_mode": "STRUCTURAL_AUDIT_ONLY",
+                        "benchmark_evidence": "SELF_REFERENTIAL_INTERNAL_COMPARISON",
+                        "independent_ground_truth_provided": False,
+                        "benchmark_thresholds_applied": False,
+                        "structural_validation_passed": False,
+                        "benchmark_validation_passed": None,
+                        "validation_passed": False,
+                        "quality_grade": "REJECTED_INVALID_SSOT",
+                    }
+                }
+
+        tester.parser = _Parser()
+        tester.geometry_engine = _Geometry()
+        tester.topology_engine = _Topology()
+        tester.constraint_solver = _ConstraintSolver()
+        tester.semantic_engine = _Semantic()
+        tester.space_engine = _Space()
+        tester.bim_core_engine = _BimCore()
+        p2_validator = _P2Validator()
+        tester.p2_validation_pipeline = p2_validator
+        tester.path_manager = types.SimpleNamespace(
+            get_relative_path=lambda path: path,
+            get_path=lambda *parts: os.path.join(*parts),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            health_report_path = os.path.join(temp_dir, "topology_health_sample_plan.json")
+            topology_validation_report_path = os.path.join(temp_dir, "topology_validation_sample_plan.json")
+            canonical_summary_path = os.path.join(temp_dir, "p2_validation_summary_sample_plan.json")
+            canonical_report_path = os.path.join(temp_dir, "P2_Validation_Report_sample_plan.md")
+
+            tester._build_topology_health_report_path = lambda filename: health_report_path
+            tester._build_topology_validation_report_path = lambda filename: topology_validation_report_path
+            tester._build_canonical_validation_summary_path = lambda filename: canonical_summary_path
+            tester._build_canonical_validation_report_path = lambda filename: canonical_report_path
+
+            original_health_reporter = regression_module.TopologyHealthReporter
+            original_validator = regression_module.TopologyValidator
+            regression_module.TopologyHealthReporter = _HealthReporter
+            regression_module.TopologyValidator = _Validator
+            try:
+                report = tester.run_on_file("sample_plan.dxf")
+            finally:
+                regression_module.TopologyHealthReporter = original_health_reporter
+                regression_module.TopologyValidator = original_validator
+
+        self.assertEqual(report["status"], "FAILURE")
+        self.assertEqual(report["error_step"], "canonical_validation")
+        self.assertIn("Canonical BIM validation failed", report["error_msg"])
+        self.assertEqual(report["steps"]["canonical_validation"]["status"], "FAILURE")
+        self.assertFalse(
+            report["steps"]["canonical_validation"]["validation_summary"]["validation_passed"]
+        )
+        self.assertEqual(
+            report["steps"]["canonical_validation"]["validation_summary"]["quality_grade"],
+            "REJECTED_INVALID_SSOT",
+        )
+        self.assertEqual(len(p2_validator.calls), 1)
+        self.assertEqual(p2_validator.calls[0]["ground_truth_path"], None)
+        self.assertTrue(
+            p2_validator.calls[0]["output_json_path"].endswith("p2_validation_summary_sample_plan.json")
+        )
+        self.assertTrue(
+            p2_validator.calls[0]["output_report_path"].endswith("P2_Validation_Report_sample_plan.md")
+        )
 
     def test_manifest_and_metrics_verify_can_pass_while_topology_health_gate_remains_visibility_only(self):
         tester = RegressionTester()
