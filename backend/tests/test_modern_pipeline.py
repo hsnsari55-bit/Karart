@@ -174,8 +174,11 @@ class TestModernPipeline(unittest.TestCase):
         engine = self._bind_engine(GeometryEngine())
 
         original_get = engine.config.get
-        engine.config.get = lambda key, default=None: (
-            0.1 if key == "tolerances.snapping_distance_mm" else original_get(key, default)
+        engine.config = types.SimpleNamespace(
+            get=lambda key, default=None: (
+                0.1 if key == "tolerances.snapping_distance_mm" else original_get(key, default)
+            ),
+            get_layer_mapping=engine.config.get_layer_mapping,
         )
         engine.snap_tolerance = 0.1
 
@@ -363,8 +366,11 @@ class TestModernPipeline(unittest.TestCase):
         def run_geometry_once(entities):
             engine = self._bind_engine(GeometryEngine())
             original_get = engine.config.get
-            engine.config.get = lambda key, default=None: (
-                0.1 if key == "tolerances.snapping_distance_mm" else original_get(key, default)
+            engine.config = types.SimpleNamespace(
+                get=lambda key, default=None: (
+                    0.1 if key == "tolerances.snapping_distance_mm" else original_get(key, default)
+                ),
+                get_layer_mapping=engine.config.get_layer_mapping,
             )
             engine.snap_tolerance = 0.1
 
@@ -449,8 +455,11 @@ class TestModernPipeline(unittest.TestCase):
         """Binary-exact equality to snap tolerance should not snap because the contract is strict `<`."""
         engine = self._bind_engine(GeometryEngine())
         original_get = engine.config.get
-        engine.config.get = lambda key, default=None: (
-            0.125 if key == "tolerances.snapping_distance_mm" else original_get(key, default)
+        engine.config = types.SimpleNamespace(
+            get=lambda key, default=None: (
+                0.125 if key == "tolerances.snapping_distance_mm" else original_get(key, default)
+            ),
+            get_layer_mapping=engine.config.get_layer_mapping,
         )
         engine.snap_tolerance = 0.125
 
@@ -518,8 +527,11 @@ class TestModernPipeline(unittest.TestCase):
         """Reusing the same GeometryEngine instance should not accumulate QA stats across identical runs."""
         engine = self._bind_engine(GeometryEngine())
         original_get = engine.config.get
-        engine.config.get = lambda key, default=None: (
-            0.1 if key == "tolerances.snapping_distance_mm" else original_get(key, default)
+        engine.config = types.SimpleNamespace(
+            get=lambda key, default=None: (
+                0.1 if key == "tolerances.snapping_distance_mm" else original_get(key, default)
+            ),
+            get_layer_mapping=engine.config.get_layer_mapping,
         )
         engine.snap_tolerance = 0.1
 
@@ -979,7 +991,9 @@ class TestModernPipeline(unittest.TestCase):
         self.assertEqual(first_run["persisted_clean_walls"], second_run["persisted_clean_walls"])
         self.assertEqual(first_run["graph"], second_run["graph"])
         self.assertEqual(first_run["persisted_graph"], second_run["persisted_graph"])
-        self.assertEqual(first_run["report"], second_run["report"])
+        first_report = {key: value for key, value in first_run["report"].items() if key != "timestamp"}
+        second_report = {key: value for key, value in second_run["report"].items() if key != "timestamp"}
+        self.assertEqual(first_report, second_report)
 
     def test_02e_parser_reuse_keeps_truncated_recover_pipeline_outputs_deterministic(self):
         """Reusing the same parser instance should keep truncated-DXF recover outputs stable through Topology health."""
@@ -1071,7 +1085,9 @@ class TestModernPipeline(unittest.TestCase):
         self.assertEqual(first_run["persisted_clean_walls"], second_run["persisted_clean_walls"])
         self.assertEqual(first_run["graph"], second_run["graph"])
         self.assertEqual(first_run["persisted_graph"], second_run["persisted_graph"])
-        self.assertEqual(first_run["report"], second_run["report"])
+        first_report = {key: value for key, value in first_run["report"].items() if key != "timestamp"}
+        second_report = {key: value for key, value in second_run["report"].items() if key != "timestamp"}
+        self.assertEqual(first_report, second_report)
 
     def test_02f_parser_reuse_keeps_semantic_space_bim_outputs_deterministic(self):
         """Reusing the same parser instance should keep Semantic -> Space -> BIM Core outputs stable."""
