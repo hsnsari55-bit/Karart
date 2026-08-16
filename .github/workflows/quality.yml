@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   quality-gates:
-    name: Execute Quality Gates (QG-1 through QG-8)
+    name: Required CI - Lint, Regression & Domain Hash
     runs-on: ubuntu-latest
 
     steps:
