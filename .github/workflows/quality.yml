@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main, dev ]
 
+permissions:
+  contents: read
+
 jobs:
   quality-gates:
     name: Execute Quality Gates (QG-1 through QG-8)
@@ -40,7 +43,3 @@ jobs:
       - name: "QG-1 & QG-3: Python Regression Tests & Domain Hash Check"
         run: |
           PYTHONPATH=. python3 backend/run_regression_tests.py
-
-      - name: "QG-4 & QG-8: Static Import Analysis & Architectural Compliance"
-        run: |
-          python3 -c "import sys; print('Static import compliance check passed.')"
