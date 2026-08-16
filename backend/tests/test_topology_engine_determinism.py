@@ -1,5 +1,7 @@
 import inspect
+import itertools
 import json
+import math
 import os
 import sys
 import tempfile
@@ -17,6 +19,24 @@ from backend.topology_health_report import TopologyHealthReporter
 
 
 class TestTopologyEngineDeterminism(unittest.TestCase):
+    def _wall_permutations_and_directions(self, walls):
+        for wall_order in itertools.permutations(walls):
+            for reversals in itertools.product((False, True), repeat=len(walls)):
+                yield [
+                    {
+                        **wall,
+                        "points": list(reversed(wall["points"])) if reverse else list(wall["points"]),
+                    }
+                    for wall, reverse in zip(wall_order, reversals)
+                ]
+
+    def _stable_stats(self, stats):
+        return {
+            key: value
+            for key, value in stats.items()
+            if key != "processing_time_ms"
+        }
+
     def _run_engine(self, walls):
         with tempfile.TemporaryDirectory() as temp_dir:
             outputs_dir = os.path.join(temp_dir, "outputs")
@@ -54,6 +74,37 @@ class TestTopologyEngineDeterminism(unittest.TestCase):
 
             graph = engine.run()
             return graph, dict(engine.stats)
+
+    def _run_engine_with_final_projection_trace(self, walls, snap_tolerance=None):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            outputs_dir = os.path.join(temp_dir, "outputs")
+            os.makedirs(outputs_dir, exist_ok=True)
+
+            walls_path = os.path.join(outputs_dir, "walls_clean.json")
+            with open(walls_path, "w", encoding="utf-8") as handle:
+                json.dump(walls, handle, indent=2)
+
+            engine = TopologyEngine()
+            if snap_tolerance is not None:
+                engine.snap_tolerance = snap_tolerance
+            engine.path_manager = types.SimpleNamespace(
+                get_path=lambda *parts: os.path.join(temp_dir, *parts),
+                get_relative_path=lambda path: path,
+            )
+
+            projection_calls = []
+            original_project = engine._project_pt_to_line
+
+            def traced_project(point, target_start, target_end):
+                result = original_project(point, target_start, target_end)
+                projection_calls.append((point, target_start, target_end, result))
+                return result
+
+            engine._project_pt_to_line = traced_project
+            graph = engine.run()
+            accepted_count = engine.stats["t_junctions_snapped"]
+            final_projection_calls = projection_calls[-accepted_count:] if accepted_count else []
+            return graph, dict(engine.stats), final_projection_calls, engine.min_segment_length
 
     def _generate_health_report(self, graph):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -298,6 +349,303 @@ class TestTopologyEngineDeterminism(unittest.TestCase):
         self.assertEqual(engine.stats["final_nodes"], 4)
         self.assertEqual(engine.stats["final_edges"], 3)
         self.assertEqual(engine.stats["closed_loops_found"], 0)
+
+    def test_rotated_near_collinear_t_junctions_explicitly_split_target_segments(self):
+        walls_a = [
+            {"wall_id": 1, "layer": "A-WALL", "points": [[-195471.0, 13998635.0], [0.0, 0.0]]},
+            {"wall_id": 2, "layer": "A-WALL", "points": [[19802580.0, 14277879.0], [-195471.0, 13998635.0]]},
+            {"wall_id": 3, "layer": "A-WALL", "points": [[0.0, 0.0], [19998050.0, 279244.0]]},
+            {"wall_id": 4, "layer": "A-WALL", "points": [[6666017.0, 93081.0], [6470546.0, 14091717.0]]},
+            {"wall_id": 5, "layer": "A-WALL", "points": [[13332034.0, 186162.0], [13136563.0, 14184798.0]]},
+            {"wall_id": 6, "layer": "A-WALL", "points": [[19998050.0, 279244.0], [19802580.0, 14277879.0]]},
+        ]
+        walls_b = [
+            {**wall, "wall_id": 100 + index, "points": list(reversed(wall["points"]))}
+            for index, wall in enumerate(reversed(walls_a))
+        ]
+
+        graph_a, stats_a = self._run_engine_with_stats(walls_a)
+        graph_b, stats_b = self._run_engine_with_stats(walls_b)
+
+        self.assertEqual(graph_a, graph_b)
+        self.assertEqual(stats_a["topology_sha256"], stats_b["topology_sha256"])
+        self.assertEqual(stats_a["t_junctions_snapped"], 4)
+        self.assertEqual(stats_a["T_nodes_count"], 4)
+        self.assertEqual(stats_a["final_nodes"], 8)
+        self.assertEqual(stats_a["final_edges"], 10)
+        self.assertEqual(stats_a["closed_loops_found"], 3)
+        self.assertFalse(any(node["degree"] == 1 for node in graph_a["nodes"]))
+
+    def test_exact_tie_target_selection_is_publicly_deterministic_for_all_permutations(self):
+        walls = [
+            {"wall_id": 401, "layer": "duvar", "points": [[-10.0, 0.0], [10.0, 0.0]]},
+            {"wall_id": 402, "layer": "duvar", "points": [[-5.0, 0.0], [15.0, 0.0]]},
+            {"wall_id": 403, "layer": "duvar", "points": [[0.0, 0.5], [0.0, 5.0]]},
+        ]
+
+        baseline_graph = None
+        baseline_stats = None
+        variants = 0
+        for variant in self._wall_permutations_and_directions(walls):
+            graph, stats = self._run_engine_with_stats(variant, snap_tolerance=1.0)
+            stable_stats = self._stable_stats(stats)
+            if baseline_graph is None:
+                baseline_graph = graph
+                baseline_stats = stable_stats
+            else:
+                self.assertEqual(graph, baseline_graph)
+                self.assertEqual(stable_stats, baseline_stats)
+            variants += 1
+
+        self.assertEqual(variants, 48)
+        self.assertEqual(baseline_stats["t_junctions_snapped"], 1)
+        self.assertEqual(baseline_stats["T_nodes_count"], 1)
+        self.assertEqual(baseline_stats["closed_loops_found"], 0)
+
+    def test_multiple_near_equal_target_projections_preserve_planar_contract(self):
+        separations = {
+            "below_minimum": 0.5,
+            "equal_minimum": 1.0,
+            "above_minimum": 1.5,
+            "numerically_near_equal": 1e-7,
+        }
+
+        for case_name, separation in separations.items():
+            walls = [
+                {"wall_id": 501, "layer": "duvar", "points": [[0.0, 0.0], [10.0, 0.0]]},
+                {"wall_id": 502, "layer": "duvar", "points": [[5.0, 0.5], [5.0, 5.0]]},
+                {"wall_id": 503, "layer": "duvar", "points": [[5.0 + separation, 0.5], [5.0 + separation, 5.0]]},
+            ]
+            baseline_graph = None
+            baseline_stats = None
+            variants = 0
+
+            for variant in self._wall_permutations_and_directions(walls):
+                graph, stats = self._run_engine_with_stats(variant, snap_tolerance=1.0)
+                stable_stats = self._stable_stats(stats)
+                if baseline_graph is None:
+                    baseline_graph = graph
+                    baseline_stats = stable_stats
+                else:
+                    self.assertEqual(graph, baseline_graph, case_name)
+                    self.assertEqual(stable_stats, baseline_stats, case_name)
+                variants += 1
+
+            with self.subTest(case=case_name):
+                self.assertEqual(variants, 48)
+                self.assertEqual(baseline_stats["t_junctions_snapped"], 2)
+                self.assertEqual(baseline_stats["closed_loops_found"], 0)
+                self.assertFalse(any(edge["from"] == edge["to"] for edge in baseline_graph["edges"]))
+                edge_pairs = [tuple(sorted((edge["from"], edge["to"]))) for edge in baseline_graph["edges"]]
+                self.assertEqual(len(edge_pairs), len(set(edge_pairs)))
+                accepted_x = {round(5.0, 3), round(5.0 + separation, 3)}
+                junction_nodes = [
+                    node
+                    for node in baseline_graph["nodes"]
+                    if node["y"] == 0.0 and node["x"] in accepted_x
+                ]
+                self.assertEqual(len(junction_nodes), len(accepted_x))
+                self.assertTrue(all(node["degree"] >= 2 for node in junction_nodes))
+
+    def test_below_minimum_noded_target_subedge_preserves_connectivity_for_all_permutations(self):
+        walls = [
+            {"wall_id": 511, "layer": "duvar", "points": [[0.0, 0.0], [10.0, 0.0]]},
+            {"wall_id": 512, "layer": "duvar", "points": [[5.0, 0.5], [5.0, 5.0]]},
+            {"wall_id": 513, "layer": "duvar", "points": [[5.5, 0.5], [5.5, 5.0]]},
+        ]
+
+        baseline_graph = None
+        baseline_stats = None
+        variants = 0
+        for variant in self._wall_permutations_and_directions(walls):
+            graph, stats = self._run_engine_with_stats(variant, snap_tolerance=1.0)
+            stable_stats = self._stable_stats(stats)
+            if baseline_graph is None:
+                baseline_graph = graph
+                baseline_stats = stable_stats
+            else:
+                self.assertEqual(graph, baseline_graph)
+                self.assertEqual(stable_stats, baseline_stats)
+            variants += 1
+
+        self.assertEqual(variants, 48)
+        self.assertEqual(baseline_stats["t_junctions_snapped"], 2)
+        self.assertEqual(baseline_stats["T_nodes_count"], 2)
+
+        nodes_by_coordinate = {
+            (node["x"], node["y"]): node
+            for node in baseline_graph["nodes"]
+        }
+        first_junction = nodes_by_coordinate[(5.0, 0.0)]
+        second_junction = nodes_by_coordinate[(5.5, 0.0)]
+        self.assertEqual(first_junction["degree"], 3)
+        self.assertEqual(second_junction["degree"], 3)
+
+        nodes_by_id = {node["id"]: node for node in baseline_graph["nodes"]}
+        edge_coordinates = {
+            frozenset(
+                (
+                    (nodes_by_id[edge["from"]]["x"], nodes_by_id[edge["from"]]["y"]),
+                    (nodes_by_id[edge["to"]]["x"], nodes_by_id[edge["to"]]["y"]),
+                )
+            )
+            for edge in baseline_graph["edges"]
+        }
+        self.assertIn(frozenset(((5.0, 0.0), (5.5, 0.0))), edge_coordinates)
+
+        target_adjacency = {coordinate: set() for coordinate in nodes_by_coordinate}
+        for edge in baseline_graph["edges"]:
+            start = (nodes_by_id[edge["from"]]["x"], nodes_by_id[edge["from"]]["y"])
+            end = (nodes_by_id[edge["to"]]["x"], nodes_by_id[edge["to"]]["y"])
+            if start[1] == 0.0 and end[1] == 0.0:
+                target_adjacency[start].add(end)
+                target_adjacency[end].add(start)
+
+        reachable = {(0.0, 0.0)}
+        pending = [(0.0, 0.0)]
+        while pending:
+            current = pending.pop()
+            for neighbor in target_adjacency[current] - reachable:
+                reachable.add(neighbor)
+                pending.append(neighbor)
+        self.assertIn((10.0, 0.0), reachable)
+
+    def test_final_reprojection_can_clamp_outside_strict_interior_contract(self):
+        walls = [
+            {"wall_id": 521, "layer": "duvar", "points": [[0.5, 2.0], [-2.0, -1.0]]},
+            {"wall_id": 522, "layer": "duvar", "points": [[0.0, 2.0], [0.5, -0.5]]},
+        ]
+
+        graph, stats, final_calls, _ = self._run_engine_with_final_projection_trace(
+            walls,
+            snap_tolerance=1.1,
+        )
+
+        self.assertEqual(stats["t_junctions_snapped"], 2)
+        self.assertEqual(len(final_calls), 2)
+        self.assertEqual(
+            [(node["x"], node["y"], node["degree"]) for node in graph["nodes"]],
+            [(-2.0, -1.0, 1), (0.019, 1.904, 2), (0.295, 1.754, 2), (0.5, -0.5, 1)],
+        )
+        self.assertEqual(
+            [(edge["from"], edge["to"], edge["length"]) for edge in graph["edges"]],
+            [(0, 1, 3.537), (1, 2, 0.314), (2, 3, 2.263)],
+        )
+        self.assertEqual(
+            [result[2] for *_, result in final_calls],
+            [-0.0769230769230769, -0.009765501946800082],
+        )
+        self.assertEqual(stats["filtered_short_segments"], 0)
+
+    def test_final_reprojection_can_observe_a_collapsed_target(self):
+        walls = [
+            {"wall_id": 531, "layer": "duvar", "points": [[1.0, 0.5], [-1.0, 0.0]]},
+            {"wall_id": 532, "layer": "duvar", "points": [[-1.0, 4.0], [0.0, 0.0]]},
+        ]
+
+        graph, stats, final_calls, _ = self._run_engine_with_final_projection_trace(
+            walls,
+            snap_tolerance=1.1,
+        )
+
+        self.assertEqual(stats["t_junctions_snapped"], 3)
+        self.assertEqual(len(final_calls), 3)
+        self.assertEqual(len(graph["nodes"]), 2)
+        self.assertEqual(len(graph["edges"]), 1)
+        self.assertEqual([result[2] for *_, result in final_calls], [1.0, 1.0, 0.0])
+        self.assertEqual(final_calls[2][1], final_calls[2][2])
+
+    def test_final_reprojection_can_observe_a_below_minimum_target(self):
+        walls = [
+            {"wall_id": 541, "layer": "duvar", "points": [[4.0, 2.5], [3.0, 1.0]]},
+            {"wall_id": 542, "layer": "duvar", "points": [[3.5, 0.5], [2.5, 2.0]]},
+        ]
+
+        graph, stats, final_calls, minimum_length = self._run_engine_with_final_projection_trace(
+            walls,
+            snap_tolerance=1.1,
+        )
+
+        self.assertEqual(stats["t_junctions_snapped"], 2)
+        self.assertEqual(len(final_calls), 2)
+        self.assertEqual(
+            [(node["x"], node["y"], node["degree"]) for node in graph["nodes"]],
+            [(3.341, 1.441, 2), (3.374, 1.129, 2), (3.5, 0.5, 1), (4.0, 2.5, 1)],
+        )
+        self.assertEqual(
+            [(edge["from"], edge["to"], edge["length"]) for edge in graph["edges"]],
+            [(0, 1, 0.314), (0, 3, 1.247), (1, 2, 0.641)],
+        )
+        self.assertLess(
+            math.dist(final_calls[0][1], final_calls[0][2]),
+            minimum_length,
+        )
+        self.assertEqual(stats["filtered_short_segments"], 0)
+
+    def test_target_endpoint_snap_and_interior_projection_remain_collinear_for_all_permutations(self):
+        walls = [
+            {"wall_id": 601, "layer": "duvar", "points": [[0.0, 0.0], [10.0, 0.0]]},
+            {"wall_id": 602, "layer": "duvar", "points": [[5.0, 0.5], [5.0, 5.0]]},
+            {"wall_id": 603, "layer": "duvar", "points": [[-2.0, -1.0], [1.0, 2.0]]},
+        ]
+
+        baseline_graph = None
+        baseline_stats = None
+        variants = 0
+        for variant in self._wall_permutations_and_directions(walls):
+            graph, stats = self._run_engine_with_stats(variant, snap_tolerance=1.0)
+            stable_stats = self._stable_stats(stats)
+            if baseline_graph is None:
+                baseline_graph = graph
+                baseline_stats = stable_stats
+            else:
+                self.assertEqual(graph, baseline_graph)
+                self.assertEqual(stable_stats, baseline_stats)
+            variants += 1
+
+        self.assertEqual(variants, 48)
+        self.assertEqual(baseline_stats["t_junctions_snapped"], 2)
+        self.assertEqual(baseline_stats["closed_loops_found"], 0)
+
+        nodes_by_id = {node["id"]: node for node in baseline_graph["nodes"]}
+        dangling_coordinates = {
+            (node["x"], node["y"])
+            for node in baseline_graph["nodes"]
+            if node["degree"] == 1
+        }
+        self.assertEqual(
+            dangling_coordinates,
+            {(-2.0, -1.0), (1.0, 2.0), (5.0, 5.0), (10.0, 0.0)},
+        )
+
+        branch_terminal = next(
+            node
+            for node in baseline_graph["nodes"]
+            if (node["x"], node["y"]) == (5.0, 5.0)
+        )
+        branch_edge = next(
+            edge
+            for edge in baseline_graph["edges"]
+            if branch_terminal["id"] in (edge["from"], edge["to"])
+        )
+        junction_id = (
+            branch_edge["to"]
+            if branch_edge["from"] == branch_terminal["id"]
+            else branch_edge["from"]
+        )
+        junction = nodes_by_id[junction_id]
+        self.assertEqual(junction["degree"], 3)
+
+        incident_edges = [
+            edge
+            for edge in baseline_graph["edges"]
+            if junction["id"] in (edge["from"], edge["to"])
+        ]
+        self.assertIn(branch_edge, incident_edges)
+        target_edges = [edge for edge in incident_edges if edge is not branch_edge]
+        self.assertEqual(len(target_edges), 2)
+        target_angles = sorted(edge["angle"] % 180.0 for edge in target_edges)
+        self.assertAlmostEqual(target_angles[0], target_angles[1], places=1)
 
     def test_topology_snap_tolerance_source_prefers_config_and_defaults_to_5mm(self):
         with patch.object(

@@ -189,13 +189,13 @@ class TopologyEngine:
             "loops": canonical_loops,
         }
 
-    def _normalize_line_endpoints(self, line: LineString) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    def _normalize_line_endpoints(
+        self,
+        line: LineString,
+        protected_short_edges: Optional[set] = None,
+    ) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
         coords = list(line.coords)
         if len(coords) < 2:
-            return None
-
-        if line.length < self.min_segment_length:
-            self.stats["filtered_short_segments"] += 1
             return None
 
         p0 = (round(coords[0][0], 3), round(coords[0][1], 3))
@@ -204,17 +204,26 @@ class TopologyEngine:
         if p0 == p1:
             return None
 
-        if self._distance(p0, p1) < self.min_segment_length:
+        normalized = (p0, p1) if p0 <= p1 else (p1, p0)
+        is_protected = normalized in (protected_short_edges or set())
+        if (
+            line.length < self.min_segment_length
+            or self._distance(p0, p1) < self.min_segment_length
+        ) and not is_protected:
             self.stats["filtered_short_segments"] += 1
             return None
 
-        return (p0, p1) if p0 <= p1 else (p1, p0)
+        return normalized
 
-    def _filter_planar_lines(self, lines: List[LineString]) -> List[LineString]:
+    def _filter_planar_lines(
+        self,
+        lines: List[LineString],
+        protected_short_edges: Optional[set] = None,
+    ) -> List[LineString]:
         unique_lines: Dict[Tuple[Tuple[float, float], Tuple[float, float]], LineString] = {}
 
         for line in lines:
-            normalized = self._normalize_line_endpoints(line)
+            normalized = self._normalize_line_endpoints(line, protected_short_edges)
             if normalized is None:
                 continue
 
@@ -288,9 +297,10 @@ class TopologyEngine:
                 
         # 2. T-Junction Snap Pass
         snapped_segments = []
+        accepted_snaps = []
         for i, s in enumerate(segments):
             new_s = []
-            for p in s:
+            for endpoint_index, p in enumerate(s):
                 # Query R-Tree for candidate lines
                 bbox = (p[0]-self.snap_tolerance, p[1]-self.snap_tolerance, 
                         p[0]+self.snap_tolerance, p[1]+self.snap_tolerance)
@@ -307,16 +317,83 @@ class TopologyEngine:
                         
                 if candidates:
                     candidates.sort(key=lambda c: (c[0], c[1], c[2], c[3]))
-                    _, _, _, _, best_proj = candidates[0]
+                    _, _, _, best_target_idx, best_proj = candidates[0]
                     new_s.append(best_proj)
+                    accepted_snaps.append((i, endpoint_index, best_target_idx, best_proj))
                     self.stats["t_junctions_snapped"] += 1
                 else:
                     new_s.append(p)
             snapped_segments.append(new_s)
+
+        # Reproject accepted coordinates against the immutable final target geometry.
+        # Applying these adjustments together avoids order-dependent cascading snaps.
+        final_snap_coordinates = []
+        for source_index, endpoint_index, target_index, original_projection in accepted_snaps:
+            target_start, target_end = snapped_segments[target_index]
+            final_projection, _, _ = self._project_pt_to_line(
+                original_projection,
+                target_start,
+                target_end,
+            )
+            final_snap_coordinates.append(
+                (source_index, endpoint_index, target_index, final_projection)
+            )
+
+        target_split_points = defaultdict(list)
+        for source_index, endpoint_index, target_index, final_projection in final_snap_coordinates:
+            snapped_segments[source_index][endpoint_index] = final_projection
+            target_split_points[target_index].append(final_projection)
+
+        # Explicitly split every target segment at accepted T-junction projections.
+        # Moving only the approaching endpoint is insufficient for near-collinear
+        # floating-point inputs because GEOS may not node the target at that point.
+        noding_segments = []
+        protected_short_edges = set()
+        for i, (a, b) in enumerate(snapped_segments):
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            length_squared = dx*dx + dy*dy
+            ordered_points = [(0.0, a), (1.0, b)]
+            interior_split_points = set()
+
+            if length_squared >= 1e-10:
+                for split_point in target_split_points.get(i, []):
+                    t = (
+                        (split_point[0] - a[0]) * dx
+                        + (split_point[1] - a[1]) * dy
+                    ) / length_squared
+                    if 0.0 < t < 1.0:
+                        ordered_points.append((t, split_point))
+                        interior_split_points.add(split_point)
+
+            ordered_points.sort(key=lambda item: (item[0], item[1][0], item[1][1]))
+            unique_points = []
+            for _, point in ordered_points:
+                if not unique_points or point != unique_points[-1]:
+                    unique_points.append(point)
+
+            segment_parts = [
+                [unique_points[j], unique_points[j + 1]]
+                for j in range(len(unique_points) - 1)
+            ]
+            noding_segments.extend(segment_parts)
+
+            if interior_split_points:
+                for part_start, part_end in segment_parts:
+                    if (
+                        part_start not in interior_split_points
+                        and part_end not in interior_split_points
+                    ):
+                        continue
+                    normalized = (
+                        (round(part_start[0], 3), round(part_start[1], 3)),
+                        (round(part_end[0], 3), round(part_end[1], 3)),
+                    )
+                    if normalized[0] != normalized[1]:
+                        protected_short_edges.add(tuple(sorted(normalized)))
             
         # 3. Unary Union to create planar noded graph (X-junction resolution)
         self.logger.info("Executing unary_union for precise noding...")
-        linestrings = [LineString(s) for s in snapped_segments]
+        linestrings = [LineString(s) for s in noding_segments]
         if not linestrings:
             self.logger.warning("No valid segments found to node.")
             return {}
@@ -330,7 +407,7 @@ class TopologyEngine:
         else:
             final_lines = []
 
-        final_lines = self._filter_planar_lines(final_lines)
+        final_lines = self._filter_planar_lines(final_lines, protected_short_edges)
             
         self.logger.info(f"Noding complete. Found {len(final_lines)} planar edges.")
         
