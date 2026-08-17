@@ -9,16 +9,22 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import html
 import json
 import math
-import os
+import re
 import shutil
 import tempfile
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 from typing import Any
 
+import ezdxf
+from ezdxf import recover
+
+from backend.dxf_parser import DXFParser
 from backend.topology_engine import TopologyEngine
+from backend.topology_validator import TopologyValidationError, TopologyValidator
 
 
 PRODUCTION_TOLERANCE_MM = 5.0
@@ -28,13 +34,25 @@ FORBIDDEN_DOWNSTREAM = (
 )
 CATEGORIES = (
     "endpoint-to-endpoint near miss",
-    "endpoint-to-segment/T-junction near miss",
+    "endpoint-to-junction near miss",
+    "endpoint-to-segment near miss",
     "legitimate architectural opening",
     "isolated annotation/non-wall",
     "truncated/incomplete",
     "wrong/incomplete block selection",
     "duplicate/overlap",
     "unresolved",
+)
+MANAGED_ARTIFACTS = (
+    "TQ01_ENGINEERING_REPORT.md",
+    "block_candidates.svg",
+    "block_selection_audit.json",
+    "component_inventory.json",
+    "dangling_nodes.csv",
+    "dangling_nodes.json",
+    "manifest.json",
+    "tolerance_sensitivity.json",
+    "topology_overview.svg",
 )
 
 
@@ -61,6 +79,19 @@ def write_json(path: Path, value: Any) -> None:
     )
 
 
+def isolated_path_manager(root: Path):
+    """Minimal PathManager contract that keeps production writes under root."""
+    return type(
+        "IsolatedPathManager",
+        (),
+        {
+            "workspace_root": str(root),
+            "get_path": staticmethod(lambda *parts: str(root.joinpath(*parts))),
+            "get_relative_path": staticmethod(lambda path: Path(path).name),
+        },
+    )()
+
+
 def distance(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
@@ -80,32 +111,31 @@ def projection(
 
 
 def rebuild_graph(
-    walls_path: Path, tolerance_mm: float = PRODUCTION_TOLERANCE_MM
-) -> tuple[dict, dict]:
+    walls_path: Path, simulation_tolerance_mm: float | None = None
+) -> tuple[dict, dict, float]:
     """Run the frozen Topology Engine while redirecting every write to temp."""
     with tempfile.TemporaryDirectory(prefix="karar-tq01-") as temp_dir:
         outputs = Path(temp_dir) / "outputs"
         outputs.mkdir()
         shutil.copyfile(walls_path, outputs / "walls_clean.json")
         engine = TopologyEngine()
-        engine.snap_tolerance = tolerance_mm
-        engine.path_manager = type(
-            "IsolatedPathManager",
-            (),
-            {
-                "get_path": staticmethod(
-                    lambda *parts: str(Path(temp_dir).joinpath(*parts))
-                ),
-                "get_relative_path": staticmethod(str),
-            },
-        )()
+        configured_tolerance = float(engine.snap_tolerance)
+        if simulation_tolerance_mm is None:
+            if configured_tolerance != PRODUCTION_TOLERANCE_MM:
+                raise RuntimeError(
+                    "configuration-drift: production snap_tolerance is "
+                    f"{configured_tolerance} mm; expected {PRODUCTION_TOLERANCE_MM} mm"
+                )
+        else:
+            engine.snap_tolerance = float(simulation_tolerance_mm)
+        engine.path_manager = isolated_path_manager(Path(temp_dir))
         graph = engine.run()
         stable_stats = {
             key: value
             for key, value in engine.stats.items()
             if key != "processing_time_ms"
         }
-        return graph, stable_stats
+        return graph, stable_stats, configured_tolerance
 
 
 def component_inventory(graph: dict) -> tuple[list[dict], dict[int, int]]:
@@ -207,7 +237,12 @@ def candidate_measurements(graph: dict, node: dict, incident_edge_id: int) -> di
     endpoint_candidates = sorted(
         (distance(point, (other["x"], other["y"])), other["id"])
         for other in graph["nodes"]
-        if other["id"] not in incident_node_ids
+        if other["id"] not in incident_node_ids and other.get("degree") == 1
+    )
+    junction_candidates = sorted(
+        (distance(point, (other["x"], other["y"])), other["id"])
+        for other in graph["nodes"]
+        if other["id"] not in incident_node_ids and other.get("degree", 0) > 2
     )
     segment_candidates = []
     for edge in graph["edges"]:
@@ -226,12 +261,17 @@ def candidate_measurements(graph: dict, node: dict, incident_edge_id: int) -> di
             segment_candidates.append((segment_distance, edge["id"], parameter))
     segment_candidates.sort()
     endpoint = endpoint_candidates[0] if endpoint_candidates else (None, None)
+    junction = junction_candidates[0] if junction_candidates else (None, None)
     segment = segment_candidates[0] if segment_candidates else (None, None, None)
     return {
         "nearest_endpoint_distance_mm": (
             None if endpoint[0] is None else round(endpoint[0], 6)
         ),
         "nearest_endpoint_node_id": endpoint[1],
+        "nearest_junction_distance_mm": (
+            None if junction[0] is None else round(junction[0], 6)
+        ),
+        "nearest_junction_node_id": junction[1],
         "nearest_nonincident_segment_distance_mm": (
             None if segment[0] is None else round(segment[0], 6)
         ),
@@ -241,6 +281,9 @@ def candidate_measurements(graph: dict, node: dict, incident_edge_id: int) -> di
         ),
         "endpoint_candidate_count_at_production_tolerance": sum(
             value < PRODUCTION_TOLERANCE_MM for value, _ in endpoint_candidates
+        ),
+        "junction_candidate_count_at_production_tolerance": sum(
+            value < PRODUCTION_TOLERANCE_MM for value, _ in junction_candidates
         ),
         "segment_candidate_count_at_production_tolerance": sum(
             value < PRODUCTION_TOLERANCE_MM
@@ -257,16 +300,20 @@ def dangling_inventory(
         incident[edge["from"]].append(edge)
         incident[edge["to"]].append(edge)
     component_sizes = Counter(node_to_component.values())
+    nodes_by_id = {node["id"]: node for node in graph["nodes"]}
     records = []
     for node in graph["nodes"]:
         if node["degree"] != 1:
             continue
         edge = incident[node["id"]][0]
         other_id = edge["to"] if edge["from"] == node["id"] else edge["from"]
-        other = graph["nodes"][other_id]
+        other = nodes_by_id[other_id]
         measurement = candidate_measurements(graph, node, edge["id"])
         endpoint_hit = (
             measurement["endpoint_candidate_count_at_production_tolerance"] > 0
+        )
+        junction_hit = (
+            measurement["junction_candidate_count_at_production_tolerance"] > 0
         )
         segment_hit = (
             measurement["segment_candidate_count_at_production_tolerance"] > 0
@@ -274,8 +321,11 @@ def dangling_inventory(
         if endpoint_hit:
             classification = CATEGORIES[0]
             evidence = "Distinct endpoint strictly inside frozen 5.0 mm tolerance."
-        elif segment_hit:
+        elif junction_hit:
             classification = CATEGORIES[1]
+            evidence = "Nonincident junction strictly inside frozen 5.0 mm tolerance."
+        elif segment_hit:
+            classification = CATEGORIES[2]
             evidence = "Nonincident segment interior strictly inside frozen 5.0 mm tolerance."
         else:
             classification = CATEGORIES[-1]
@@ -299,7 +349,9 @@ def dangling_inventory(
                     walls,
                 ),
                 **measurement,
-                "production_tolerance_candidate": endpoint_hit or segment_hit,
+                "production_tolerance_candidate": (
+                    endpoint_hit or junction_hit or segment_hit
+                ),
                 "classification": classification,
                 "evidence": evidence,
             }
@@ -316,24 +368,38 @@ def tolerance_sensitivity(dangling: list[dict]) -> dict:
             if item["nearest_endpoint_distance_mm"] is not None
             and item["nearest_endpoint_distance_mm"] < tolerance
         ]
+        junction_nodes = [
+            item["node_id"]
+            for item in dangling
+            if item["nearest_junction_distance_mm"] is not None
+            and item["nearest_junction_distance_mm"] < tolerance
+        ]
         segment_nodes = [
             item["node_id"]
             for item in dangling
             if item["nearest_nonincident_segment_distance_mm"] is not None
             and item["nearest_nonincident_segment_distance_mm"] < tolerance
         ]
-        ambiguous_nodes = sorted(set(endpoint_nodes).intersection(segment_nodes))
+        candidate_sets = [set(endpoint_nodes), set(junction_nodes), set(segment_nodes)]
+        ambiguous_nodes = sorted(
+            set().union(
+                *(left.intersection(right)
+                  for index, left in enumerate(candidate_sets)
+                  for right in candidate_sets[index + 1:])
+            )
+        )
         bands.append(
             {
                 "tolerance_mm": tolerance,
                 "endpoint_to_endpoint_candidate_node_ids": endpoint_nodes,
+                "endpoint_to_junction_candidate_node_ids": junction_nodes,
                 "endpoint_to_segment_candidate_node_ids": segment_nodes,
                 "predicted_max_dangling_reduction": len(
-                    set(endpoint_nodes + segment_nodes)
+                    set(endpoint_nodes + junction_nodes + segment_nodes)
                 ),
                 "ambiguous_candidate_node_ids": ambiguous_nodes,
                 "ambiguity_count": len(ambiguous_nodes),
-                "ambiguity": "both_candidate_types_within_band",
+                "ambiguity": "multiple_candidate_types_within_band",
                 "false_link_risk": "unquantified_without_architectural_ground_truth",
             }
         )
@@ -406,9 +472,10 @@ def topology_svg(
         radius = 3 if is_dangling else 1.5
         lines.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="{radius}" fill="{fill}"/>')
         if is_dangling:
+            label = html.escape(f'N{node["id"]}')
             lines.append(
                 f'<text x="{x + 4:.2f}" y="{y - 4:.2f}" fill="#991b1b">'
-                f'N{node["id"]}</text>'
+                f'{label}</text>'
             )
     lines.append('</g>')
     for item in dangling:
@@ -425,6 +492,20 @@ def topology_svg(
             lines.append(
                 f'<line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" '
                 f'y2="{y2:.2f}" stroke="#dc2626" stroke-dasharray="5 4"/>'
+            )
+        junction_id = item["nearest_junction_node_id"]
+        if (
+            junction_id is not None
+            and item["nearest_junction_distance_mm"] is not None
+            and item["nearest_junction_distance_mm"] < PRODUCTION_TOLERANCE_MM
+        ):
+            node = nodes_by_id[item["node_id"]]
+            junction = nodes_by_id[junction_id]
+            x1, y1 = transform(node["x"], node["y"])
+            x2, y2 = transform(junction["x"], junction["y"])
+            lines.append(
+                f'<line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" '
+                f'y2="{y2:.2f}" stroke="#059669" stroke-dasharray="2 3"/>'
             )
         segment_id = item["nearest_nonincident_segment_edge_id"]
         parameter = item["projection_parameter"]
@@ -452,7 +533,7 @@ def topology_svg(
             '<text x="20" y="24" font-family="sans-serif" font-size="16">'
             'TQ-01 topology overview</text>',
             f'<text x="20" y="48" font-family="monospace" font-size="11">'
-            f'bbox={bounds}; scale={scale:.6f}px/mm; deterministic component colors</text>',
+            f'bbox={html.escape(str(bounds))}; scale={scale:.6f}px/mm; deterministic component colors</text>',
             '<g font-family="sans-serif" font-size="11">',
             '<text x="1050" y="24">Legend</text>',
             '<circle cx="1060" cy="45" r="3" fill="#dc2626"/>',
@@ -460,13 +541,16 @@ def topology_svg(
             '<line x1="1050" y1="65" x2="1080" y2="65" stroke="#dc2626" '
             'stroke-dasharray="5 4"/>',
             '<text x="1090" y="69">endpoint near-miss</text>',
-            '<line x1="1050" y1="85" x2="1080" y2="85" stroke="#7c3aed" '
+            '<line x1="1050" y1="85" x2="1080" y2="85" stroke="#059669" '
+            'stroke-dasharray="2 3"/>',
+            '<text x="1090" y="89">endpoint-to-junction near-miss</text>',
+            '<line x1="1050" y1="105" x2="1080" y2="105" stroke="#7c3aed" '
             'stroke-dasharray="3 3"/>',
-            '<text x="1090" y="89">T-junction near-miss</text>',
-            '<line x1="1050" y1="105" x2="1080" y2="105" stroke="#eab308" '
+            '<text x="1090" y="109">endpoint-to-segment near-miss</text>',
+            '<line x1="1050" y1="125" x2="1080" y2="125" stroke="#eab308" '
             'stroke-width="3"/>',
-            '<text x="1090" y="109">closed-loop boundary</text>',
-            '<text x="1050" y="129">edge color = component ID modulo palette</text>',
+            '<text x="1090" y="129">closed-loop boundary</text>',
+            '<text x="1050" y="149">edge color = component ID modulo palette</text>',
             '</g>',
             '</svg>\n',
         ]
@@ -479,18 +563,141 @@ def block_svg(raw: dict) -> str:
     count = sum(
         entity.get("block_name") == promoted for entity in raw.get("entities", [])
     )
-    bounds = json.dumps(raw.get("bounding_box", "UNKNOWN"), sort_keys=True)
+    promoted_label = html.escape(str(promoted), quote=True)
+    bounds = html.escape(
+        json.dumps(raw.get("bounding_box", "UNKNOWN"), sort_keys=True),
+        quote=True,
+    )
     return (
         '<svg xmlns="http://www.w3.org/2000/svg" width="900" height="240">'
         '<rect width="100%" height="100%" fill="white" stroke="#334155"/>'
         '<text x="24" y="45" font-family="sans-serif" font-size="22">Recorded parser block candidate</text>'
-        f'<text x="24" y="90" font-family="monospace">name={promoted}</text>'
+        f'<text x="24" y="90" font-family="monospace">name={promoted_label}</text>'
         f'<text x="24" y="125" font-family="monospace">recorded entities={count}</text>'
         f'<text x="24" y="160" font-family="monospace">bbox={bounds}</text>'
         '<text x="24" y="205" font-family="sans-serif" fill="#991b1b">'
         'Historical snapshot; not a successful re-parse of the truncated source.</text>'
         '</svg>\n'
     )
+
+
+def normalize_exception(exc: BaseException, private_paths: list[Path]) -> dict:
+    evidence = " ".join(str(exc).split())
+    for private_path in private_paths:
+        for candidate in {str(private_path), private_path.as_posix()}:
+            evidence = evidence.replace(candidate, "<isolated-path>")
+    evidence = re.sub(r"<isolated-path>(?:[\\/][^\s:'\"]+)*", "<isolated-path>", evidence)
+    return {"type": type(exc).__name__, "evidence": evidence}
+
+
+def document_counts(doc: Any) -> dict:
+    user_blocks = [
+        block
+        for block in doc.blocks
+        if "MODEL_SPACE" not in block.name.upper()
+        and "PAPER_SPACE" not in block.name.upper()
+    ]
+    return {
+        "modelspace_entities": sum(1 for _ in doc.modelspace()),
+        "block_count": len(user_blocks),
+        "nonempty_blocks": sum(len(block) > 0 for block in user_blocks),
+        "block_entities": sum(len(block) for block in user_blocks),
+    }
+
+
+def probe_standard_read(source: Path) -> dict:
+    result = {"status": "NOT_EXECUTED"}
+    with tempfile.TemporaryDirectory(prefix="karar-tq01-standard-") as temp_dir:
+        root = Path(temp_dir)
+        copy = root / "source.dxf"
+        shutil.copyfile(source, copy)
+        try:
+            result = {"status": "PASS", **document_counts(ezdxf.readfile(copy))}
+        except Exception as exc:  # Evidence must preserve the production library result.
+            result = {
+                "status": "FAIL",
+                "exception": normalize_exception(exc, [root, copy]),
+            }
+    return result
+
+
+def probe_production_parser(source: Path) -> dict:
+    result = {"status": "NOT_EXECUTED"}
+    with tempfile.TemporaryDirectory(prefix="karar-tq01-parser-") as temp_dir:
+        root = Path(temp_dir)
+        copy = root / "source.dxf"
+        shutil.copyfile(source, copy)
+        try:
+            parser = DXFParser()
+            parser.path_manager = isolated_path_manager(root)
+            payload = parser.parse(str(copy))
+            entities = payload.get("entities", [])
+            block_entity_counts = dict(
+                sorted(
+                    Counter(
+                        entity.get("block_name", "UNKNOWN")
+                        for entity in entities
+                    ).items()
+                )
+            )
+            repaired_copy_created = Path(f"{copy}.repaired.dxf").exists()
+            if payload.get("error"):
+                result = {
+                    "status": "FAIL",
+                    "entity_count": len(entities),
+                    "block_count": len(block_entity_counts),
+                    "block_entity_counts": block_entity_counts,
+                    "repaired_copy_created": repaired_copy_created,
+                    "exception": {
+                        "type": "ParserReturnedError",
+                        "evidence": normalize_exception(
+                            RuntimeError(payload["error"]), [root, copy]
+                        )["evidence"],
+                    },
+                }
+            else:
+                result = {
+                    "status": "PASS",
+                    "entity_count": len(entities),
+                    "block_count": len(block_entity_counts),
+                    "block_entity_counts": block_entity_counts,
+                    "repaired_copy_created": repaired_copy_created,
+                    "promoted_block": payload.get("metadata", {}).get(
+                        "promoted_block"
+                    ),
+                    "skipped_entities": payload.get("metadata", {}).get(
+                        "skipped_entities", 0
+                    ),
+                }
+        except Exception as exc:
+            result = {
+                "status": "FAIL",
+                "exception": normalize_exception(exc, [root, copy]),
+            }
+    return result
+
+
+def probe_original_recover(source: Path) -> dict:
+    result = {"status": "NOT_EXECUTED"}
+    with tempfile.TemporaryDirectory(prefix="karar-tq01-recover-") as temp_dir:
+        root = Path(temp_dir)
+        copy = root / "source.dxf"
+        shutil.copyfile(source, copy)
+        try:
+            doc, _auditor = recover.readfile(copy)
+            counts = document_counts(doc)
+            status = (
+                "PASS"
+                if counts["modelspace_entities"] + counts["block_entities"] > 0
+                else "EMPTY_GEOMETRY"
+            )
+            result = {"status": status, **counts}
+        except Exception as exc:
+            result = {
+                "status": "FAIL",
+                "exception": normalize_exception(exc, [root, copy]),
+            }
+    return result
 
 
 def source_audit(source: Path, raw_path: Path, raw: dict) -> dict:
@@ -502,32 +709,21 @@ def source_audit(source: Path, raw_path: Path, raw: dict) -> dict:
     )
     return {
         "source": {
-            "absolute_path": str(source.resolve()),
-            "relative_path": os.path.relpath(source.resolve(), Path.cwd()),
+            "name": source.name,
             "size_bytes": source.stat().st_size,
             "sha256": sha256_file(source),
             "structurally_truncated": "EOF" not in text_tail[-50:],
             "tail_latin1": text_tail,
-            "standard_read": {
-                "status": "FAIL",
-                "evidence": "controlled baseline: missing ENDSEC tag",
-            },
-            "smart_repair": {
-                "status": "FAIL",
-                "evidence": "controlled temp-copy baseline: invalid ENDBLK after incomplete LWPO token",
-            },
-            "original_recover": {
-                "status": "EMPTY_GEOMETRY",
-                "modelspace_entities": 0,
-                "nonempty_blocks": 0,
-            },
+            "standard_read": probe_standard_read(source),
+            "production_smart_repair": probe_production_parser(source),
+            "original_recover": probe_original_recover(source),
         },
         "historical_snapshot": {
-            "path": str(raw_path),
+            "name": raw_path.name,
             "sha256": sha256_file(raw_path),
             "entity_count": len(entities),
             "source_file_field": raw.get("source_file"),
-            "reproducible_from_current_source": False,
+            "reproduction_equivalence": "NOT_EVALUATED",
         },
         "block_candidates": [
             {
@@ -550,23 +746,89 @@ def source_audit(source: Path, raw_path: Path, raw: dict) -> dict:
     }
 
 
-def engineering_report(counts: dict, hashes: dict, classes: Counter) -> str:
+def failed_validator_check(error: str) -> str:
+    mappings = (
+        ("zero nodes", "non_empty_nodes"),
+        ("zero edges", "non_empty_edges"),
+        ("zero closed loops", "non_empty_loops"),
+        ("degree metadata", "degree_metadata_consistency"),
+        ("Dangling/open topology", "no_dangling_nodes"),
+        ("Self-loop edges", "no_self_loop_edges"),
+        ("Duplicate undirected edges", "no_duplicate_undirected_edges"),
+        ("Disconnected components", "single_connected_component"),
+        ("boundary is open", "all_loops_closed"),
+        ("tiny/sliver face", "loop_area_integrity"),
+        ("insufficient unique edge", "sufficient_unique_loop_edges"),
+        ("references missing edge", "loop_edge_reference_integrity"),
+        ("does not map to a graph edge", "face_edge_consistency"),
+        ("face-edge mapping is inconsistent", "face_edge_consistency"),
+        ("references missing node", "node_reference_integrity"),
+        ("invalid endpoint node ids", "node_reference_integrity"),
+    )
+    return next((check for phrase, check in mappings if phrase in error), "validator_exception")
+
+
+def validate_topology_graph(graph: dict) -> dict:
+    with tempfile.TemporaryDirectory(prefix="karar-tq01-validator-") as temp_dir:
+        report_path = Path(temp_dir) / "topology_validation_report.json"
+        validator = TopologyValidator(report_output_path=str(report_path))
+        try:
+            validator.validate(graph)
+        except TopologyValidationError as exc:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            error = str(exc)
+            return {
+                "topology": "FAIL",
+                "validator_error": error,
+                "failed_check": failed_validator_check(error),
+                "validator_report_status": report["status"],
+                "no_safe_repair_proven": True,
+                "safe_repair_evidence": (
+                    "No repair was executed; candidate measurements do not prove "
+                    "architectural intent or a safe automatic repair."
+                ),
+                "downstream_executed": False,
+            }
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        return {
+            "topology": "PASS",
+            "validator_error": None,
+            "failed_check": None,
+            "validator_report_status": report["status"],
+            "no_safe_repair_proven": False,
+            "safe_repair_evidence": "Not applicable because frozen validation passed.",
+            "downstream_executed": False,
+        }
+
+
+def engineering_report(
+    counts: dict, hashes: dict, classes: Counter, audit: dict, gate: dict
+) -> str:
     question = (
         "Bu değişiklik Geometry Engine, Topology Engine veya Canonical BIM Model’in "
         "doğruluğunu, determinizmini, sağlamlığını ya da performansını ölçülebilir "
         "şekilde artırıyor mu?"
+    )
+    source_statuses = {
+        name: audit["source"][name]["status"]
+        for name in ("standard_read", "production_smart_repair", "original_recover")
+    }
+    status = (
+        "TQ-01 QUALIFIED_BLOCKED_NO_SAFE_FIX"
+        if gate["topology"] == "FAIL" and gate["no_safe_repair_proven"]
+        else "TQ-01 QUALIFIED"
     )
     return f"""# Kanıt
 
 - RV-01 walls snapshot SHA-256: `{hashes['walls']}`.
 - İki izole rebuild aynı graph SHA-256 üretti: `{hashes['graph']}`.
 - Ölçüm: {counts['walls']} walls, {counts['nodes']} nodes, {counts['edges']} edges, {counts['loops']} loops, {counts['components']} components, {counts['dangling']} dangling.
-- Kaynak DXF SHA-256: `{hashes['source']}`; mevcut parser ile yeniden üretilemiyor.
+- Kaynak DXF SHA-256: `{hashes['source']}`; execution-derived probe statüleri: `{source_statuses}`.
 - Sınıflandırma: `{dict(sorted(classes.items()))}`.
 
 # Risk Analizi
 
-- Snapshot graph deterministik, fakat kesik DXF’den uçtan uca yeniden üretilebilir değil.
+- Snapshot graph deterministik; source-to-snapshot eşitliği probe sonuçlarından ayrıca kanıtlanmış değildir.
 - Geometry/Topology kontratı entity kimliği taşımadığından entity provenance `UNKNOWN`.
 - Ground truth olmadan unresolved uçların opening veya engine bug olduğu iddia edilemez.
 
@@ -578,18 +840,18 @@ def engineering_report(counts: dict, hashes: dict, classes: Counter) -> str:
 # Uygulanan Değişiklik
 
 - Production engine değiştirilmedi. İzole read-only diagnostic ve raw-byte manifest eklendi.
-- {question} **EVET** — topology sorunlarının ölçülebilir, tekrar üretilebilir teşhisini sağlar; geometriyi değiştirmez.
+- {question} **HAYIR.** Production core değişmedi; yalnız observability ve reproducibility iyileştirildi.
 
 # Doğrulama
 
 - İki rebuild hash’i eşit; production config değiştirilmedi.
-- Topology gate FAIL: dangling={counts['dangling']}, components={counts['components']}. Downstream çalıştırılmadı.
+- Frozen TopologyValidator gate: `{gate['topology']}`; failed_check=`{gate['failed_check']}`; downstream çalıştırılmadı.
 - Accuracy/F1/IoU iddiası yok.
 
 # Kalan Riskler
 
 - Tam DXF ve ground truth olmadan block completeness ve legitimate openings doğrulanamaz.
-- Safe automatic repair kanıtlanmadı; status `TQ-01 QUALIFIED_BLOCKED_NO_SAFE_FIX`.
+- Safe automatic repair uygulanmadı; status `{status}`.
 """
 
 
@@ -598,7 +860,8 @@ def write_csv(path: Path, dangling: list[dict]) -> None:
         "node_id", "x", "y", "component_id", "component_size",
         "incident_edge_id", "incident_edge_length_mm", "layer", "block",
         "entity_type", "entity_id", "nearest_endpoint_node_id",
-        "nearest_endpoint_distance_mm", "nearest_nonincident_segment_edge_id",
+        "nearest_endpoint_distance_mm", "nearest_junction_node_id",
+        "nearest_junction_distance_mm", "nearest_nonincident_segment_edge_id",
         "nearest_nonincident_segment_distance_mm", "projection_parameter",
         "production_tolerance_candidate", "classification", "evidence",
     ]
@@ -617,27 +880,22 @@ def run_diagnostics(
     source = source.resolve()
     walls_path = walls_path.resolve()
     raw_path = raw_path.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    unexpected_downstream = [
-        name for name in FORBIDDEN_DOWNSTREAM if (output_dir / name).exists()
-    ]
-    if unexpected_downstream:
-        raise RuntimeError(
-            "Blocked topology output contains forbidden downstream artifacts: "
-            + ", ".join(unexpected_downstream)
-        )
     walls = json.loads(walls_path.read_text(encoding="utf-8"))
     raw = json.loads(raw_path.read_text(encoding="utf-8"))
 
-    graph_a, stats_a = rebuild_graph(walls_path)
-    graph_b, stats_b = rebuild_graph(walls_path)
+    graph_a, stats_a, configured_tolerance_a = rebuild_graph(walls_path)
+    graph_b, stats_b, configured_tolerance_b = rebuild_graph(walls_path)
     graph_hash_a = hashlib.sha256(
         json.dumps(graph_a, indent=4, sort_keys=True).encode("utf-8")
     ).hexdigest()
     graph_hash_b = hashlib.sha256(
         json.dumps(graph_b, indent=4, sort_keys=True).encode("utf-8")
     ).hexdigest()
-    if graph_hash_a != graph_hash_b or stats_a != stats_b:
+    if (
+        graph_hash_a != graph_hash_b
+        or stats_a != stats_b
+        or configured_tolerance_a != configured_tolerance_b
+    ):
         raise RuntimeError("Topology rebuild is not deterministic")
 
     components, node_to_component = component_inventory(graph_a)
@@ -650,80 +908,109 @@ def run_diagnostics(
         "components": len(components),
         "dangling": len(dangling),
     }
-    write_json(output_dir / "block_selection_audit.json", source_audit(source, raw_path, raw))
-    (output_dir / "block_candidates.svg").write_text(
-        block_svg(raw), encoding="utf-8", newline="\n"
-    )
-    write_json(
-        output_dir / "dangling_nodes.json",
-        {"categories": CATEGORIES, "count": len(dangling), "nodes": dangling},
-    )
-    write_csv(output_dir / "dangling_nodes.csv", dangling)
-    write_json(
-        output_dir / "component_inventory.json",
-        {"count": len(components), "components": components},
-    )
-    (output_dir / "topology_overview.svg").write_text(
-        topology_svg(graph_a, dangling, node_to_component),
-        encoding="utf-8",
-        newline="\n",
-    )
-    write_json(
-        output_dir / "tolerance_sensitivity.json",
-        tolerance_sensitivity(dangling),
-    )
     hashes = {
         "source": sha256_file(source),
         "walls": sha256_file(walls_path),
         "graph": graph_hash_a,
     }
-    report = engineering_report(
-        counts, hashes, Counter(item["classification"] for item in dangling)
-    )
-    (output_dir / "TQ01_ENGINEERING_REPORT.md").write_text(
-        report, encoding="utf-8", newline="\n"
+    audit = source_audit(source, raw_path, raw)
+    gate = validate_topology_graph(graph_a)
+    status = (
+        "TQ-01 QUALIFIED_BLOCKED_NO_SAFE_FIX"
+        if gate["topology"] == "FAIL" and gate["no_safe_repair_proven"]
+        else "TQ-01 QUALIFIED"
     )
 
-    artifact_names = sorted(
-        path.name
-        for path in output_dir.iterdir()
-        if path.is_file() and path.name != "manifest.json"
-    )
-    manifest = {
-        "schema_version": "tq01-manifest-v1",
-        "status": "TQ-01 QUALIFIED_BLOCKED_NO_SAFE_FIX",
-        "hard_gate": {"topology": "FAIL", "downstream_executed": False},
-        "counts": counts,
-        "inputs": {
-            "source_dxf": {"path": str(source), "sha256": hashes["source"]},
-            "historical_walls_snapshot": {
-                "path": str(walls_path), "sha256": hashes["walls"]
+    with tempfile.TemporaryDirectory(prefix="karar-tq01-package-") as temp_dir:
+        staging = Path(temp_dir)
+        write_json(staging / "block_selection_audit.json", audit)
+        (staging / "block_candidates.svg").write_text(
+            block_svg(raw), encoding="utf-8", newline="\n"
+        )
+        write_json(
+            staging / "dangling_nodes.json",
+            {"categories": CATEGORIES, "count": len(dangling), "nodes": dangling},
+        )
+        write_csv(staging / "dangling_nodes.csv", dangling)
+        write_json(
+            staging / "component_inventory.json",
+            {"count": len(components), "components": components},
+        )
+        (staging / "topology_overview.svg").write_text(
+            topology_svg(graph_a, dangling, node_to_component),
+            encoding="utf-8",
+            newline="\n",
+        )
+        sensitivity = tolerance_sensitivity(dangling)
+        sensitivity["configured_snap_tolerance_mm"] = configured_tolerance_a
+        write_json(staging / "tolerance_sensitivity.json", sensitivity)
+        report = engineering_report(
+            counts,
+            hashes,
+            Counter(item["classification"] for item in dangling),
+            audit,
+            gate,
+        )
+        (staging / "TQ01_ENGINEERING_REPORT.md").write_text(
+            report, encoding="utf-8", newline="\n"
+        )
+
+        artifact_names = sorted(set(MANAGED_ARTIFACTS) - {"manifest.json"})
+        manifest = {
+            "schema_version": "tq01-manifest-v1",
+            "status": status,
+            "hard_gate": gate,
+            "counts": counts,
+            "configuration": {
+                "configured_snap_tolerance_mm": configured_tolerance_a,
+                "expected_snap_tolerance_mm": PRODUCTION_TOLERANCE_MM,
+                "production_config_modified": False,
             },
-            "historical_raw_snapshot": {
-                "path": str(raw_path), "sha256": sha256_file(raw_path)
+            "inputs": {
+                "source_dxf": {"name": source.name, "sha256": hashes["source"]},
+                "historical_walls_snapshot": {
+                    "name": walls_path.name,
+                    "sha256": hashes["walls"],
+                },
+                "historical_raw_snapshot": {
+                    "name": raw_path.name,
+                    "sha256": sha256_file(raw_path),
+                },
             },
-        },
-        "determinism": {
-            "run_1_graph_sha256": graph_hash_a,
-            "run_2_graph_sha256": graph_hash_b,
-            "equal": True,
-        },
-        "artifacts": {
-            name: {
-                "size_bytes": (output_dir / name).stat().st_size,
-                "sha256": sha256_file(output_dir / name),
-            }
-            for name in artifact_names
-        },
-        "forbidden_downstream_artifacts": {
-            name: {
-                "expected_absent": True,
-                "absent": not (output_dir / name).exists(),
-            }
-            for name in FORBIDDEN_DOWNSTREAM
-        },
-    }
-    write_json(output_dir / "manifest.json", manifest)
+            "determinism": {
+                "run_1_graph_sha256": graph_hash_a,
+                "run_2_graph_sha256": graph_hash_b,
+                "equal": True,
+            },
+            "artifacts": {
+                name: {
+                    "size_bytes": (staging / name).stat().st_size,
+                    "sha256": sha256_file(staging / name),
+                }
+                for name in artifact_names
+            },
+            "forbidden_downstream_artifacts": {
+                name: {"expected_absent": True, "absent": True}
+                for name in FORBIDDEN_DOWNSTREAM
+            },
+        }
+        write_json(staging / "manifest.json", manifest)
+        staged_names = {path.name for path in staging.iterdir()}
+        if staged_names != set(MANAGED_ARTIFACTS):
+            raise RuntimeError(
+                "Staged artifact set mismatch: "
+                f"expected={sorted(MANAGED_ARTIFACTS)}, actual={sorted(staged_names)}"
+            )
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for existing in output_dir.iterdir():
+            if existing.is_dir():
+                shutil.rmtree(existing)
+            else:
+                existing.unlink()
+        for name in MANAGED_ARTIFACTS:
+            shutil.copyfile(staging / name, output_dir / name)
+
     return manifest
 
 
