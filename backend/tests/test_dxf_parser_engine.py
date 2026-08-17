@@ -1,5 +1,6 @@
 import os
 import unittest
+from unittest import mock
 import ezdxf
 from ezdxf.layouts import Modelspace
 
@@ -363,6 +364,30 @@ class TestDXFParserEngine(unittest.TestCase):
         self.assertAlmostEqual(bbox["max_x"], 100.0, places=3)
         self.assertAlmostEqual(bbox["max_y"], 200.0, places=3)
 
+        self.assert_parse_results_equal(first_result, second_result)
+
+    def test_truncated_block_repair_is_retained_when_original_recover_has_no_geometry(self):
+        empty_recovered_doc = ezdxf.new(dxfversion='R2010')
+
+        with mock.patch(
+            "ezdxf.recover.readfile",
+            return_value=(empty_recovered_doc, mock.Mock()),
+        ):
+            first_result = self.parser.parse(
+                self.truncated_nested_block_dxf_path,
+                block_filter="RECOVER_FILTER_PLAN",
+            )
+            second_result = self.parser.parse(
+                self.truncated_nested_block_dxf_path,
+                block_filter="RECOVER_FILTER_PLAN",
+            )
+
+        self.assertEqual(first_result["metadata"]["promoted_block"], "RECOVER_FILTER_PLAN")
+        self.assertEqual(first_result["metadata"]["promotion_reason"], "filter_match")
+        self.assertEqual(len(first_result["entities"]), 2)
+        self.assertTrue(
+            all(entity.get("block_name") == "INNER_RECOVER_GEOM" for entity in first_result["entities"])
+        )
         self.assert_parse_results_equal(first_result, second_result)
 
     def tearDown(self):

@@ -159,6 +159,17 @@ class DXFParser:
         except Exception:
             return False
 
+    def _blocks_have_entities(self, doc) -> bool:
+        try:
+            return any(
+                len(block) > 0
+                for block in doc.blocks
+                if "MODEL_SPACE" not in block.name.upper()
+                and "PAPER_SPACE" not in block.name.upper()
+            )
+        except Exception:
+            return False
+
     def parse(self, filename: str, block_filter: Any = None) -> Dict[str, Any]:
         """
         Parses the DXF file using ezdxf and writes to outputs/dxf_raw.json.
@@ -221,11 +232,19 @@ class DXFParser:
 
         if smart_repair_attempted and doc is not None and not self._modelspace_has_entities(doc):
             self.logger.warning(
-                "Smart repair produced an empty modelspace. Retrying recover mode on original DXF to avoid geometry loss..."
+                "Smart repair produced an empty modelspace. Inspecting recover mode on original DXF without discarding repaired blocks..."
             )
             try:
                 from ezdxf import recover
-                doc, auditor = recover.readfile(filepath)
+                recovered_doc, auditor = recover.readfile(filepath)
+                if self._modelspace_has_entities(recovered_doc):
+                    doc = recovered_doc
+                    self.logger.info("Original recover restored modelspace entities; using recovered document.")
+                elif not self._blocks_have_entities(doc) and self._blocks_have_entities(recovered_doc):
+                    doc = recovered_doc
+                    self.logger.info("Original recover restored block entities absent from repaired document; using recovered document.")
+                else:
+                    self.logger.info("Retaining repaired document so recoverable block geometry is not discarded.")
             except Exception as e4:
                 self.logger.warning(f"Fallback recover on original after empty smart-repair result failed: {e4}")
 
