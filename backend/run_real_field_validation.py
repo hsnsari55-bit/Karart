@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import sys
@@ -9,9 +10,9 @@ if REPOSITORY_ROOT not in sys.path:
 from backend.run_regression_tests import RegressionTester
 
 
-def main():
+def main(source_path):
     tester = RegressionTester()
-    result = tester.run_on_file('datasets/twin_villa/dxf/kaRar.dxf')
+    result = tester.run_on_file(source_path)
     print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
 
     if result.get("status") == "SUCCESS":
@@ -23,4 +24,7 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    parser = argparse.ArgumentParser(description="Run the mandatory CAD-to-BIM validation gates.")
+    parser.add_argument("source_path", help="DXF source to validate")
+    args = parser.parse_args()
+    sys.exit(main(args.source_path))
