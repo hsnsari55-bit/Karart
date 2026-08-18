@@ -15,6 +15,7 @@ import math
 import re
 import shutil
 import tempfile
+import uuid
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,44 @@ MANAGED_ARTIFACTS = (
     "tolerance_sensitivity.json",
     "topology_overview.svg",
 )
+
+
+def validate_output_dir(output_dir: Path) -> Path:
+    """Resolve a dedicated TQ-01 target without traversing directory symlinks."""
+    lexical = Path(output_dir).absolute()
+    for candidate in (lexical, *lexical.parents):
+        if candidate.is_symlink():
+            raise ValueError(f"Unsafe TQ-01 output symlink: {candidate}")
+
+    resolved = lexical.resolve()
+    repo_root = Path(__file__).resolve().parents[1]
+    forbidden = {Path(resolved.anchor), repo_root, Path.cwd().resolve(), Path.home().resolve()}
+    if resolved in forbidden:
+        raise ValueError(f"Unsafe broad TQ-01 output target: {resolved}")
+
+    destination_name = resolved.name.lower()
+    dedicated = (
+        destination_name == "tq01"
+        or destination_name.startswith("tq01-")
+        or destination_name.startswith("tq01_")
+        or any(part.lower() == "tq01" for part in resolved.parts[:-1])
+    )
+    if not dedicated:
+        raise ValueError(f"Output must be inside a dedicated TQ-01 directory: {resolved}")
+    return resolved
+
+
+def remove_tree_without_following_symlinks(path: Path) -> None:
+    """Remove a package tree while unlinking, never traversing, symlinks."""
+    if path.is_symlink() or not path.is_dir():
+        path.unlink()
+        return
+    for child in path.iterdir():
+        if child.is_symlink() or not child.is_dir():
+            child.unlink()
+        else:
+            remove_tree_without_following_symlinks(child)
+    path.rmdir()
 
 
 def sha256_file(path: Path) -> str:
@@ -877,6 +916,7 @@ def write_csv(path: Path, dangling: list[dict]) -> None:
 def run_diagnostics(
     source: Path, walls_path: Path, raw_path: Path, output_dir: Path
 ) -> dict:
+    output_dir = validate_output_dir(output_dir)
     source = source.resolve()
     walls_path = walls_path.resolve()
     raw_path = raw_path.resolve()
@@ -1002,14 +1042,37 @@ def run_diagnostics(
                 f"expected={sorted(MANAGED_ARTIFACTS)}, actual={sorted(staged_names)}"
             )
 
-        output_dir.mkdir(parents=True, exist_ok=True)
-        for existing in output_dir.iterdir():
-            if existing.is_dir():
-                shutil.rmtree(existing)
-            else:
-                existing.unlink()
-        for name in MANAGED_ARTIFACTS:
-            shutil.copyfile(staging / name, output_dir / name)
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        publish_staging = Path(
+            tempfile.mkdtemp(
+                prefix=f".{output_dir.name}.staging-", dir=output_dir.parent
+            )
+        )
+        backup = output_dir.parent / f".{output_dir.name}.backup-{uuid.uuid4().hex}"
+        try:
+            for name in MANAGED_ARTIFACTS:
+                shutil.copyfile(staging / name, publish_staging / name)
+            published_names = {path.name for path in publish_staging.iterdir()}
+            if published_names != set(MANAGED_ARTIFACTS):
+                raise RuntimeError("Published staging artifact set mismatch")
+            for name in MANAGED_ARTIFACTS:
+                if sha256_file(staging / name) != sha256_file(publish_staging / name):
+                    raise RuntimeError(f"Published staging hash mismatch: {name}")
+
+            had_previous = output_dir.exists()
+            if had_previous:
+                output_dir.replace(backup)
+            try:
+                publish_staging.replace(output_dir)
+            except Exception:
+                if had_previous:
+                    backup.replace(output_dir)
+                raise
+            if had_previous:
+                remove_tree_without_following_symlinks(backup)
+        finally:
+            if publish_staging.exists() or publish_staging.is_symlink():
+                remove_tree_without_following_symlinks(publish_staging)
 
     return manifest
 

@@ -203,11 +203,11 @@ class TestTQ01TopologyDiagnostics(unittest.TestCase):
             source, walls_path, raw_path = self.create_inputs(
                 root, [wall([0, 0], [100, 0]), wall([110, 0], [210, 0])]
             )
-            output_a = root / "result-a"
+            output_a = root / "tq01-package-a"
             output_a.mkdir()
             (output_a / "stale.txt").write_text("stale", encoding="utf-8")
             (output_a / "stale-dir").mkdir()
-            output_b = root / "result-b"
+            output_b = root / "tq01-package-b"
             manifest = run_diagnostics(source, walls_path, raw_path, output_a)
             manifest_b = run_diagnostics(source, walls_path, raw_path, output_b)
 
@@ -244,6 +244,22 @@ class TestTQ01TopologyDiagnostics(unittest.TestCase):
                     self.assertNotIn("Ã", text)
                     self.assertNotIn("Â", text)
 
+    def test_unsafe_output_target_is_rejected_and_sentinel_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "tq01-parent"
+            root.mkdir()
+            source, walls_path, raw_path = self.create_inputs(root, [])
+            unsafe_output = root / "ordinary-output"
+            unsafe_output.mkdir()
+            sentinel = unsafe_output / "sentinel.txt"
+            sentinel.write_text("must survive", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "dedicated TQ-01 directory"):
+                run_diagnostics(source, walls_path, raw_path, unsafe_output)
+
+            self.assertEqual("must survive", sentinel.read_text(encoding="utf-8"))
+            self.assertEqual({"sentinel.txt"}, {path.name for path in unsafe_output.iterdir()})
+
     def test_closed_walls_package_is_qualified_not_blocked(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -254,7 +270,7 @@ class TestTQ01TopologyDiagnostics(unittest.TestCase):
                     wall([100, 100], [0, 100]), wall([0, 100], [0, 0]),
                 ],
             )
-            manifest = run_diagnostics(source, walls_path, raw_path, root / "result")
+            manifest = run_diagnostics(source, walls_path, raw_path, root / "tq01-result")
             self.assertEqual("TQ-01 QUALIFIED", manifest["status"])
             self.assertEqual("PASS", manifest["hard_gate"]["topology"])
             self.assertIsNone(manifest["hard_gate"]["failed_check"])
