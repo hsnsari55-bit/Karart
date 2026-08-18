@@ -1,22 +1,33 @@
+import copy
+import csv
 import json
 import os
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest.mock import patch
 
 from backend.tq02_topology_root_cause import (
+    EXPECTED_COUNTS,
+    EXPECTED_GEOMETRY_SHA256,
+    EXPECTED_GRAPH_CORE_SHA256,
+    EXPECTED_SOURCE_SHA256,
+    EXPECTED_TOPOLOGY_SHA256,
     MANAGED_ARTIFACTS,
     build_dangling_inventory,
     compare_constraint_graphs,
+    component_investigation,
     evaluate_core_fix_gate,
     evidence_matrix,
+    layer_ablation,
     publish_package,
     provenance_inventory,
     selection_experiments,
     stable_hash,
     validate_output_dir,
 )
+from backend.tq01_topology_diagnostics import component_inventory
 
 
 def _graph():
@@ -41,7 +52,7 @@ def _run_fixture():
         {"layer": "DUVAR", "block_name": "default", "type": "LWPOLYLINE", "points": [[0, 0], [10, 0]]},
         {"layer": "DUVAR", "block_name": "default", "type": "LWPOLYLINE", "points": [[12, 0], [20, 0]]},
     ]
-    node_to_component = {0: 0, 1: 0, 2: 1, 3: 1}
+    components, node_to_component = component_inventory(graph)
     dangling = build_dangling_inventory(graph, walls, node_to_component)
     core_hash = stable_hash(graph)
     return {
@@ -53,9 +64,36 @@ def _run_fixture():
         "validator": {"topology": "FAIL", "downstream_executed": False},
         "raw": {"entities": [{"layer": "DUVAR", "block_name": "default", "type": "LINE"}] * 2},
         "walls": walls, "graph": graph,
-        "components": [{"component_id": 0}, {"component_id": 1}],
+        "components": components,
         "node_to_component": node_to_component, "dangling": dangling,
     }
+
+
+def _locked_gate_run():
+    run = _run_fixture()
+    run.update({
+        "source": {
+            "name": "proje.dxf",
+            "sha256": EXPECTED_SOURCE_SHA256,
+            "copy_sha256_before": EXPECTED_SOURCE_SHA256,
+            "copy_sha256_after": EXPECTED_SOURCE_SHA256,
+            "original_sha256_after": EXPECTED_SOURCE_SHA256,
+        },
+        "parser": {"entity_count": EXPECTED_COUNTS["parser_entities"]},
+        "configuration": {"production_tolerance_mm": 5.0, "production_config_modified": False},
+        "geometry": {"hash": EXPECTED_GEOMETRY_SHA256},
+        "topology": {"hash": EXPECTED_TOPOLOGY_SHA256},
+        "counts": copy.deepcopy(EXPECTED_COUNTS),
+        "tiny_loop_ids": [1, 2, 3],
+        "constraint": {
+            "graph_core_equal": True,
+            "pre_core_sha256": EXPECTED_GRAPH_CORE_SHA256,
+            "contribution": "none_observed",
+        },
+        "validator": {"topology": "FAIL", "downstream_executed": False},
+        "downstream_instantiated": False,
+    })
+    return run
 
 
 class TestTQ02TopologyRootCause(unittest.TestCase):
@@ -73,6 +111,9 @@ class TestTQ02TopologyRootCause(unittest.TestCase):
         self.assertEqual(provenance["artifact_contract"], "dangling_provenance_summary_v1")
         self.assertFalse(provenance["exact_entity_lineage_available"])
         self.assertEqual(provenance["record_count"], len(run["dangling"]))
+        self.assertEqual(provenance["attributed_block_counts"], {"default": 4})
+        self.assertTrue(all(item["provenance"]["block"] == "default" for item in run["dangling"]))
+        self.assertTrue(all("block_name" not in item["provenance"] for item in run["dangling"]))
         self.assertEqual(selection["artifact_contract"], "selection_inventory_v1")
         self.assertIn("raw_layer_counts", selection)
         self.assertNotIn("raw_layer_counts", provenance)
@@ -94,6 +135,134 @@ class TestTQ02TopologyRootCause(unittest.TestCase):
         self.assertEqual(gate["decision"], "NO_CORE_FIX_INSUFFICIENT_PROOF")
         self.assertEqual(len(gate["checks"]), 10)
         self.assertFalse(gate["frozen_core_edited"])
+
+    def test_first_five_gate_checks_are_run_derived_and_individually_falsifiable(self):
+        run = _locked_gate_run()
+        repeat = copy.deepcopy(run)
+        names = [
+            "exact_authoritative_source",
+            "baseline_matches_locked_values",
+            "two_independent_runs_deterministic",
+            "validator_failure_reproduced",
+            "constraint_contribution_excluded",
+        ]
+        baseline = {item["name"]: item["passed"] for item in evaluate_core_fix_gate(run, repeat)["checks"]}
+        self.assertTrue(all(baseline[name] for name in names))
+
+        mutations = [
+            lambda current, repeated: current["source"].__setitem__("sha256", "drift"),
+            lambda current, repeated: current["counts"].__setitem__("nodes", -1),
+            lambda current, repeated: repeated["counts"].__setitem__("nodes", -1),
+            lambda current, repeated: current["validator"].__setitem__("topology", "PASS"),
+            lambda current, repeated: current["constraint"].__setitem__("graph_core_equal", False),
+        ]
+        for expected_false, mutate in zip(names, mutations):
+            with self.subTest(check=expected_false):
+                current, repeated = copy.deepcopy(run), copy.deepcopy(repeat)
+                mutate(current, repeated)
+                checks = {
+                    item["name"]: item["passed"]
+                    for item in evaluate_core_fix_gate(current, repeated)["checks"]
+                }
+                self.assertFalse(checks[expected_false])
+                self.assertFalse(evaluate_core_fix_gate(current, repeated)["passed"])
+
+    def test_caller_boolean_assertions_cannot_authorize_core_edit(self):
+        claimed = {name: True for name in (
+            "defect_isolated_to_topology_engine", "minimal_reproducer_exists",
+            "permutation_invariant_reproducer", "translation_invariant_reproducer",
+            "mathematical_expected_result_unambiguous",
+        )}
+        gate = evaluate_core_fix_gate(_locked_gate_run(), _locked_gate_run(), claimed)
+        self.assertFalse(gate["passed"])
+        self.assertTrue(gate["caller_assertions_ignored"])
+        self.assertFalse(gate["independent_reproducer_evidence_verified"])
+        self.assertTrue(all(not item["passed"] for item in gate["checks"][5:]))
+
+    def test_crafted_reproducer_envelope_cannot_authorize_core_edit(self):
+        expected_graph = {"nodes": [{"id": 1}], "edges": []}
+        actual_graph = {"nodes": [{"id": 2}], "edges": []}
+        expected_hash = stable_hash(expected_graph)
+        actual_hash = stable_hash(actual_graph)
+        payload = {
+            "stage_isolation": {
+                "parser_geometry_reproduced_sha256": "same",
+                "parser_geometry_expected_sha256": "same",
+                "topology_actual_sha256": actual_hash,
+                "topology_expected_sha256": expected_hash,
+            },
+            "minimal_reproducer": {
+                "input_graph": {"nodes": [{"id": 0}]},
+                "expected_graph": expected_graph,
+                "actual_graph": actual_graph,
+                "expected_graph_sha256": expected_hash,
+                "actual_graph_sha256": actual_hash,
+            },
+            "permutation_output_sha256": [actual_hash, actual_hash],
+            "translation_normalized_output_sha256": [actual_hash, actual_hash],
+            "mathematical_rule": "caller supplied claim",
+        }
+        envelope = {
+            "schema_version": "tq02-independent-reproducer-v1",
+            "verifier": "backend.tq02_topology_root_cause",
+            "payload_sha256": stable_hash(payload),
+            "verified_payload": payload,
+        }
+        gate = evaluate_core_fix_gate(_locked_gate_run(), _locked_gate_run(), envelope)
+        self.assertFalse(gate["passed"])
+        self.assertFalse(gate["independent_reproducer_evidence_verified"])
+        self.assertEqual(
+            gate["independent_reproducer_evidence_status"],
+            "UNTRUSTED_CALLER_INPUT_INTERNAL_VERIFIER_NOT_IMPLEMENTED",
+        )
+        self.assertTrue(all(not item["passed"] for item in gate["checks"][5:]))
+
+    def test_layer_ablation_has_combined_baseline_and_sorted_isolated_layers(self):
+        walls = [
+            {"layer": "Z", "id": 1},
+            {"layer": "A", "id": 2},
+            {"layer": "Z", "id": 3},
+        ]
+
+        def fake_run_topology(selected, tolerance):
+            count = len(selected)
+            graph = {
+                "nodes": [
+                    {"id": index, "x": float(index), "y": 0.0, "degree": 0}
+                    for index in range(count)
+                ],
+                "edges": [],
+                "loops": [],
+            }
+            return graph, {"tolerance": tolerance}
+
+        with patch("backend.tq02_topology_root_cause._run_topology", side_effect=fake_run_topology):
+            result = layer_ablation(walls)
+
+        self.assertEqual(
+            [item["selection"] for item in result["runs"]],
+            ["combined_production_baseline", "isolated_layer:A", "isolated_layer:Z"],
+        )
+        self.assertEqual([item["wall_count"] for item in result["runs"]], [3, 1, 2])
+        self.assertFalse(result["production_config_modified"])
+
+    def test_component_investigation_is_stable_and_uses_real_provenance_tuples(self):
+        run = _run_fixture()
+        first = component_investigation(run)
+        second = component_investigation(copy.deepcopy(run))
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 2)
+        self.assertTrue(all(item["stable_id"].startswith("cmp-") for item in first))
+        self.assertTrue(all(len(item["structural_sha256"]) == 64 for item in first))
+        self.assertTrue(all(item["nearest_component_node_distance_mm"] == 2.0 for item in first))
+        self.assertEqual(
+            sum(row["count"] for item in first for row in item["provenance_tuple_counts"]),
+            len(run["dangling"]),
+        )
+        self.assertEqual(
+            {row["block"] for item in first for row in item["provenance_tuple_counts"]},
+            {"default"},
+        )
 
     def test_unsafe_output_is_rejected_and_sentinel_preserved(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -123,22 +292,43 @@ class TestTQ02TopologyRootCause(unittest.TestCase):
                 {path.name: path.read_bytes() for path in out_b.iterdir()},
             )
             manifest = json.loads((out_a / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["schema_version"], "tq02-manifest-v2")
+            self.assertEqual(manifest["status"], "TQ02_AWAITING_HUMAN_GROUND_TRUTH")
+            self.assertEqual(set(manifest["artifacts"]), set(MANAGED_ARTIFACTS) - {"manifest.json"})
             self.assertFalse(manifest["downstream_instantiated"])
             self.assertFalse(manifest["production_config_modified"])
             self.assertNotEqual(
                 manifest["artifacts"]["provenance_inventory.json"]["sha256"],
                 manifest["artifacts"]["selection_experiments.json"]["sha256"],
             )
-            for svg in ("topology_overview.svg", "dangling_candidates.svg"):
-                ET.parse(out_a / svg)
+            for svg in ("topology_overview.svg", "dangling_candidates.svg", "largest_component.svg"):
+                root = ET.parse(out_a / svg).getroot()
+                self.assertTrue(root.findall(".//{http://www.w3.org/2000/svg}line"))
+            dangling_svg = (out_a / "dangling_candidates.svg").read_text(encoding="utf-8")
+            self.assertIn("<circle", dangling_svg)
+
+            with (out_a / "component_layer_matrix.csv").open(encoding="utf-8", newline="") as handle:
+                matrix_rows = list(csv.DictReader(handle))
+            self.assertEqual(sum(int(row["attributed_count"]) for row in matrix_rows), 4)
+            self.assertEqual({row["block"] for row in matrix_rows}, {"default"})
+            self.assertEqual({row["entity_type"] for row in matrix_rows}, {"LWPOLYLINE"})
+
+            with (out_a / "ground_truth_review.csv").open(encoding="utf-8", newline="") as handle:
+                review_rows = list(csv.DictReader(handle))
+            self.assertEqual(len(review_rows), 4)
+            self.assertTrue(all(row["review_label"] == row["reviewer"] == row["review_notes"] == "" for row in review_rows))
+
+            root_cause = json.loads((out_a / "root_cause_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(root_cause["validator_invariant_mismatch"], "NOT_EVALUATED_INSUFFICIENT_GROUND_TRUTH")
             report = (out_a / "TQ02_ENGINEERING_REPORT.md").read_text(encoding="utf-8")
             self.assertEqual(
-                [line for line in report.splitlines() if line.startswith("# ")],
+                [line for line in report.splitlines() if line.startswith("## ")],
                 [
-                    "# Kanıt", "# Risk Analizi", "# Önerilen Çözüm",
-                    "# Uygulanan Değişiklik", "# Doğrulama", "# Kalan Riskler",
+                    "## 1. Kanıt", "## 2. Risk Analizi", "## 3. Önerilen Çözüm",
+                    "## 4. Uygulanan Değişiklik", "## 5. Doğrulama", "## 6. Kalan Riskler",
                 ],
             )
+            self.assertIn("HAYIR — Bu değişiklik core algoritma davranışını değiştirmez", report)
             self.assertNotIn("Ã", report)
             self.assertNotIn("Â", report)
 

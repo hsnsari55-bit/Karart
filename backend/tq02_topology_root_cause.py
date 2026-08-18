@@ -32,6 +32,7 @@ from backend.tq01_topology_diagnostics import (
     isolated_path_manager,
     remove_tree_without_following_symlinks,
     sha256_file,
+    svg_transform,
     topology_svg,
     validate_topology_graph,
     wall_provenance,
@@ -64,10 +65,13 @@ MANAGED_ARTIFACTS = (
     "TQ02_ENGINEERING_REPORT.md",
     "baseline_comparison.json",
     "component_inventory.json",
+    "component_layer_matrix.csv",
     "dangling_candidates.svg",
     "dangling_nodes.csv",
     "dangling_nodes.json",
     "evidence_matrix.json",
+    "ground_truth_review.csv",
+    "largest_component.svg",
     "manifest.json",
     "provenance_inventory.json",
     "root_cause_summary.json",
@@ -308,7 +312,7 @@ def selection_experiments(raw: dict, walls: list[dict], dangling: list[dict]) ->
 def provenance_inventory(dangling: list[dict]) -> dict:
     confidence = Counter(item["provenance"].get("confidence", "UNKNOWN") for item in dangling)
     layers = Counter(item["provenance"].get("layer", "UNKNOWN") for item in dangling)
-    blocks = Counter(item["provenance"].get("block_name", "UNKNOWN") for item in dangling)
+    blocks = Counter(item["provenance"].get("block", "UNKNOWN") for item in dangling)
     methods = Counter(item["provenance"].get("method", "UNKNOWN") for item in dangling)
     exact_lineage = Counter(
         str(item["provenance"].get("exact_entity_lineage", False)).lower()
@@ -354,19 +358,72 @@ def tolerance_experiments(walls: list[dict]) -> dict:
     }
 
 
-def evaluate_core_fix_gate(independent_reproducer: dict | None = None) -> dict:
-    proof = independent_reproducer or {}
+def _comparable_run_evidence(run: dict) -> dict:
+    keys = (
+        "source", "intake", "parser", "configuration", "geometry", "topology",
+        "counts", "tiny_loop_ids", "constraint", "validator", "downstream_instantiated",
+    )
+    return {key: run.get(key) for key in keys}
+
+
+def evaluate_core_fix_gate(
+    run: dict | None = None,
+    repeat_run: dict | None = None,
+    independent_reproducer: dict | None = None,
+) -> dict:
+    """Evaluate measured evidence; caller-provided claims never authorize a core edit.
+
+    TQ-02 has no internal independent-reproducer executor.  Consequently an external
+    mapping, even if it contains hashes or verifier-looking labels, is untrusted input
+    and the reproducer-dependent checks remain fail-closed.
+    """
+    run = run or {}
+    source = run.get("source", {})
+    constraint = run.get("constraint", {})
+    validator = run.get("validator", {})
+    baseline_matches = bool(run) and all((
+        run.get("counts") == EXPECTED_COUNTS,
+        run.get("geometry", {}).get("hash") == EXPECTED_GEOMETRY_SHA256,
+        run.get("topology", {}).get("hash") == EXPECTED_TOPOLOGY_SHA256,
+        constraint.get("pre_core_sha256") == EXPECTED_GRAPH_CORE_SHA256,
+    ))
+    source_matches = bool(run) and all((
+        source.get("sha256") == EXPECTED_SOURCE_SHA256,
+        source.get("copy_sha256_before") == EXPECTED_SOURCE_SHA256,
+        source.get("copy_sha256_after") == EXPECTED_SOURCE_SHA256,
+        source.get("original_sha256_after") == EXPECTED_SOURCE_SHA256,
+    ))
+    deterministic = bool(run and repeat_run) and (
+        _comparable_run_evidence(run) == _comparable_run_evidence(repeat_run)
+    )
+    validator_failed = validator.get("topology") == "FAIL"
+    constraint_excluded = (
+        constraint.get("graph_core_equal") is True
+        and constraint.get("contribution") == "none_observed"
+    )
+    reproducer_submitted = independent_reproducer is not None
+    reproducer_evidence_status = (
+        "UNTRUSTED_CALLER_INPUT_INTERNAL_VERIFIER_NOT_IMPLEMENTED"
+        if reproducer_submitted
+        else "NOT_PROVIDED_INTERNAL_VERIFIER_NOT_IMPLEMENTED"
+    )
+    verified_payload = False
+    defect_isolated = False
+    minimal_exists = False
+    permutation_invariant = False
+    translation_invariant = False
+    mathematical_expected = False
     checks = [
-        ("exact_authoritative_source", True),
-        ("baseline_matches_locked_values", True),
-        ("two_independent_runs_deterministic", True),
-        ("validator_failure_reproduced", True),
-        ("constraint_contribution_excluded", True),
-        ("defect_isolated_to_topology_engine", bool(proof.get("isolated"))),
-        ("minimal_reproducer_exists", bool(proof.get("exists"))),
-        ("permutation_invariant_reproducer", bool(proof.get("permutation_invariant"))),
-        ("translation_invariant_reproducer", bool(proof.get("translation_invariant"))),
-        ("mathematical_expected_result_unambiguous", bool(proof.get("unambiguous"))),
+        ("exact_authoritative_source", source_matches),
+        ("baseline_matches_locked_values", baseline_matches),
+        ("two_independent_runs_deterministic", deterministic),
+        ("validator_failure_reproduced", validator_failed),
+        ("constraint_contribution_excluded", constraint_excluded),
+        ("defect_isolated_to_topology_engine", defect_isolated),
+        ("minimal_reproducer_exists", minimal_exists),
+        ("permutation_invariant_reproducer", permutation_invariant),
+        ("translation_invariant_reproducer", translation_invariant),
+        ("mathematical_expected_result_unambiguous", mathematical_expected),
     ]
     passed = all(value for _, value in checks)
     return {
@@ -374,78 +431,196 @@ def evaluate_core_fix_gate(independent_reproducer: dict | None = None) -> dict:
         "passed": passed,
         "decision": "CORE_FIX_PERMITTED" if passed else "NO_CORE_FIX_INSUFFICIENT_PROOF",
         "frozen_core_edited": False,
+        "independent_reproducer_evidence_verified": verified_payload,
+        "independent_reproducer_evidence_status": reproducer_evidence_status,
+        "caller_assertions_ignored": reproducer_submitted,
     }
 
 
 def evidence_matrix(run: dict, gate: dict) -> list[dict]:
+    counts = run["counts"]
     return [
         {"hypothesis": "source/modelspace content", "level": "A", "result": "observed_input_candidate_contributor",
-         "evidence": "AC1027/INSUNITS=4/audit=0; 13665 modelspace entities; 478 components persist; observation does not prove causality"},
+         "evidence": f"{counts['modelspace_entities']} modelspace entities and {counts['components']} components observed; observation does not prove causality"},
         {"hypothesis": "parser/block/layer selection", "level": "B", "result": "candidate_contributor",
          "evidence": "modelspace selected; no block promotion; graph lacks exact entity lineage"},
         {"hypothesis": "geometry classification/filtering", "level": "B", "result": "candidate_contributor",
-         "evidence": "1809 selected entities become 2088 walls; filtering/snapping/merge are measured"},
+         "evidence": f"actual run produced {counts['walls']} walls; filtering/snapping/merge are measured"},
         {"hypothesis": "topology engine defect", "level": "D", "result": "not_proven",
          "evidence": "no independent minimal mathematical reproducer"},
         {"hypothesis": "constraint solver", "level": "A+", "result": "excluded_for_observed_graph",
          "evidence": f"pre/post graph core equal={run['constraint']['graph_core_equal']}"},
-        {"hypothesis": "validator invariant mismatch", "level": "A", "result": "not_supported",
-         "evidence": "validator reports measured dangling/open graph; invariant was not relaxed"},
+        {"hypothesis": "validator invariant mismatch", "level": "D", "result": "NOT_EVALUATED_INSUFFICIENT_GROUND_TRUTH",
+         "evidence": "validator reports measured dangling/open graph; architectural ground truth is unavailable"},
         {"hypothesis": "overall", "level": "B", "result": "mixed_source_selection_geometry_insufficient_intent",
          "evidence": gate["decision"]},
     ]
 
 
-def candidate_svg(graph: dict, dangling: list[dict]) -> str:
+def _spatial_svg(
+    graph: dict,
+    dangling: list[dict],
+    title: str,
+    component_node_ids: set[int] | None = None,
+) -> str:
     nodes = {node["id"]: node for node in graph["nodes"]}
+    dangling_by_id = {item["node_id"]: item for item in dangling}
+    visible_nodes = set(nodes) if component_node_ids is None else set(component_node_ids)
+    view_graph = {
+        "nodes": [node for node in graph["nodes"] if node["id"] in visible_nodes],
+        "edges": [
+            edge for edge in graph["edges"]
+            if edge["from"] in visible_nodes and edge["to"] in visible_nodes
+        ],
+        "loops": [],
+    }
+    if not view_graph["nodes"]:
+        raise ValueError("Spatial SVG requires at least one visible graph node")
+    transform, _, _ = svg_transform(view_graph, width=1400, height=900)
     rows = [
-        '<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="700">',
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="900">',
         '<rect width="100%" height="100%" fill="white"/>',
-        '<text x="20" y="30" font-family="sans-serif" font-size="18">TQ-02 dangling candidate evidence</text>',
+        f'<text x="20" y="30" font-family="sans-serif" font-size="18">{html.escape(title)}</text>',
+        '<g stroke="#94a3b8" stroke-width="1" fill="none">',
     ]
-    for index, item in enumerate(dangling[:30]):
-        node = nodes[item["node_id"]]
-        y = 58 + index * 20
-        label = html.escape(
-            f"N{node['id']} ({node['x']:.3f},{node['y']:.3f}) {item['classification']} level={item['evidence_level']}"
-        )
-        rows.append(f'<text x="24" y="{y}" font-family="monospace" font-size="11">{label}</text>')
-    rows.append('<text x="24" y="680" font-family="sans-serif" font-size="11">First 30 records; coordinate-bearing local artifact, not committed.</text></svg>\n')
+    for edge in graph["edges"]:
+        if edge["from"] not in visible_nodes or edge["to"] not in visible_nodes:
+            continue
+        start, end = nodes[edge["from"]], nodes[edge["to"]]
+        x1, y1 = transform(start["x"], start["y"])
+        x2, y2 = transform(end["x"], end["y"])
+        rows.append(f'<line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" y2="{y2:.2f}"/>')
+    rows.append('</g><g stroke="#991b1b" stroke-width="1" fill="#dc2626">')
+    for node_id, item in sorted(dangling_by_id.items()):
+        if node_id not in visible_nodes:
+            continue
+        node = nodes[node_id]
+        x, y = transform(node["x"], node["y"])
+        color = {"B": "#16a34a", "C": "#ea580c", "D": "#dc2626"}[item["evidence_level"]]
+        rows.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="3.2" fill="{color}"><title>N{node_id} {html.escape(item["classification"])}</title></circle>')
+    rows.append('</g><text x="20" y="880" font-family="sans-serif" font-size="12">Green=B candidate, orange=C ambiguous, red=D unresolved; geometry is spatial, not a text table.</text></svg>\n')
     return "".join(rows)
+
+
+def candidate_svg(graph: dict, dangling: list[dict]) -> str:
+    return _spatial_svg(graph, dangling, "TQ-02 spatial dangling candidate evidence")
+
+
+def component_investigation(run: dict) -> list[dict]:
+    graph, dangling = run["graph"], run["dangling"]
+    nodes = {node["id"]: node for node in graph["nodes"]}
+    edges = {edge["id"]: edge for edge in graph["edges"]}
+    dangling_by_component: dict[int, list[dict]] = defaultdict(list)
+    for item in dangling:
+        dangling_by_component[item["component_id"]].append(item)
+    records = []
+    all_points = [(node["id"], node["x"], node["y"]) for node in graph["nodes"]]
+    for base in run["components"]:
+        node_ids, edge_ids = base["node_ids"], base["edge_ids"]
+        points = [(nodes[node_id]["x"], nodes[node_id]["y"]) for node_id in node_ids]
+        canonical_nodes = sorted((round(x, 6), round(y, 6)) for x, y in points)
+        canonical_edges = sorted(
+            tuple(sorted(((round(nodes[edges[eid]["from"]]["x"], 6), round(nodes[edges[eid]["from"]]["y"], 6)),
+                          (round(nodes[edges[eid]["to"]]["x"], 6), round(nodes[edges[eid]["to"]]["y"], 6)))))
+            for eid in edge_ids
+        )
+        signature = stable_hash({"nodes": canonical_nodes, "edges": canonical_edges})
+        member = set(node_ids)
+        outside_points = [
+            (x, y) for node_id, x, y in all_points if node_id not in member
+        ]
+        nearest = min(
+            (round(((inside_x - outside_x) ** 2 + (inside_y - outside_y) ** 2) ** 0.5, 6)
+             for inside_x, inside_y in points
+             for outside_x, outside_y in outside_points),
+            default=None,
+        )
+        edge_id_set = set(edge_ids)
+        loops = [
+            loop for loop in graph.get("loops", [])
+            if set(loop.get("edges", [])).issubset(edge_id_set)
+        ]
+        provenance = [item["provenance"] for item in dangling_by_component[base["component_id"]]]
+        provenance_tuples = Counter(
+            (
+                item.get("layer", "UNKNOWN"),
+                item.get("block", "UNKNOWN"),
+                item.get("entity_type", "UNKNOWN"),
+            )
+            for item in provenance
+        )
+        records.append({
+            **base, "stable_id": f"cmp-{signature[:16]}", "structural_sha256": signature,
+            "bbox": {"min_x": min(x for x, _ in points), "min_y": min(y for _, y in points), "max_x": max(x for x, _ in points), "max_y": max(y for _, y in points)},
+            "centroid": {"x": round(sum(x for x, _ in points) / len(points), 6), "y": round(sum(y for _, y in points) / len(points), 6)},
+            "total_edge_length_mm": round(sum(float(edges[eid].get("length", 0.0)) for eid in edge_ids), 6),
+            "degree_histogram": dict(sorted(Counter(str(nodes[node_id].get("degree", 0)) for node_id in node_ids).items())),
+            "loop_count": len(loops), "tiny_loop_count": sum(float(loop.get("area", 0.0)) < 1.0 for loop in loops),
+            "sliver_loop_count": sum(float(loop.get("area", 0.0)) < 10.0 for loop in loops),
+            "nearest_component_node_distance_mm": nearest,
+            "provenance_layer_counts": dict(sorted(Counter(item.get("layer", "UNKNOWN") for item in provenance).items())),
+            "provenance_block_counts": dict(sorted(Counter(item.get("block", "UNKNOWN") for item in provenance).items())),
+            "provenance_tuple_counts": [
+                {"layer": layer, "block": block, "entity_type": entity_type, "count": count}
+                for (layer, block, entity_type), count in sorted(provenance_tuples.items())
+            ],
+        })
+    return sorted(records, key=lambda item: item["stable_id"])
+
+
+def layer_ablation(walls: list[dict]) -> dict:
+    layers = sorted({wall.get("layer", "UNKNOWN") for wall in walls})
+    runs = []
+    for label, selected in [("combined_production_baseline", walls)] + [
+        (f"isolated_layer:{layer}", [wall for wall in walls if wall.get("layer", "UNKNOWN") == layer])
+        for layer in layers
+    ]:
+        graph, _ = _run_topology(selected, PRODUCTION_TOLERANCE_MM)
+        components, _ = component_inventory(graph)
+        runs.append({"selection": label, "wall_count": len(selected), "nodes": len(graph["nodes"]), "edges": len(graph["edges"]), "loops": len(graph["loops"]), "components": len(components), "dangling": sum(node.get("degree") == 1 for node in graph["nodes"]), "graph_sha256": stable_hash(graph, pretty=True)})
+    return {"method": "isolated selected-wall-layer topology ablation plus combined production baseline", "production_config_modified": False, "accuracy_claim": "none_without_ground_truth", "runs": runs}
+
+
+PRIORITY_ANSWER = "HAYIR — Bu değişiklik core algoritma davranışını değiştirmez; yalnız kanıt sözleşmesini ve insan inceleme paketini düzeltir."
 
 
 def engineering_report(run: dict, matrix: list[dict], gate: dict) -> str:
     counts = run["counts"]
-    return f"""# Kanıt
+    checks = {item["name"]: item["passed"] for item in gate["checks"]}
+    repeat_result = (
+        "eşleşti" if checks["two_independent_runs_deterministic"]
+        else "NOT_EVALUATED_OR_MISMATCH"
+    )
+    return f"""## 1. Kanıt
 
 - Yetkili DXF SHA-256: `{run['source']['sha256']}`; AC1027, INSUNITS={run['intake']['insunits']}, audit errors/fixes={run['intake']['audit_errors']}/{run['intake']['audit_fixes']}.
-- İki exact-source koşu ve production 5.0 mm baseline eşleşti: geometry `{run['geometry']['hash']}`, topology `{run['topology']['hash']}`.
+- İki exact-source koşu karşılaştırması: `{repeat_result}`; production geometry `{run['geometry']['hash']}`, topology `{run['topology']['hash']}`.
 - Ölçüm: {counts['nodes']} nodes, {counts['edges']} edges, {counts['loops']} loops, {counts['components']} components, {counts['dangling']} dangling, {counts['tiny_loops']} tiny loops.
 - Evidence matrix sonucu: `{matrix[-1]['result']}`.
 
-# Risk Analizi
+## 2. Risk Analizi
 
 - Graph kontratı DXF entity kimliğini taşımadığı için provenance geometrik ve kanıt-sınırlıdır; exact entity lineage iddia edilmez.
 - Ground truth olmadan opening, gereksiz çizgi ve yanlış duvar seçimi birbirinden kesin ayrıştırılamaz.
 - Tolerance ablation bağlantı sayısını ölçer fakat mimari doğruluk veya false-link oranını kanıtlamaz.
 
-# Önerilen Çözüm
+## 3. Önerilen Çözüm
 
 - İnsan-onaylı layer/entity ground truth ve bağımsız minimal reproducer sağlanmadan frozen core değiştirilmemeli.
 - Provenance kontratı gelecekte Parser→Geometry→Topology boyunca açık kimlik eşlemesiyle ayrı ADR kapsamında ele alınmalı.
 
-# Uygulanan Değişiklik
+## 4. Uygulanan Değişiklik
 
 - Production core değiştirilmedi; exact-source izole diagnostics, attribution envanteri ve atomik local artifact publisher eklendi.
-- “Bu değişiklik Geometry Engine, Topology Engine veya Canonical BIM Model’in doğruluğunu, determinizmini, sağlamlığını ya da performansını ölçülebilir şekilde artırıyor mu?” **EVET, ölçülebilir tanılama/determinizm kanıtı üretir; algoritmik davranışı değiştirmez.**
+- “Bu değişiklik Geometry Engine, Topology Engine veya Canonical BIM Model’in doğruluğunu, determinizmini, sağlamlığını ya da performansını ölçülebilir şekilde artırıyor mu?” **{PRIORITY_ANSWER}**
 
-# Doğrulama
+## 5. Doğrulama
 
 - Constraint pre/post core equal=`{run['constraint']['graph_core_equal']}`; validator=`{run['validator']['topology']}`; downstream çalıştırılmadı.
 - Conditional core-fix gate: `{gate['decision']}`; frozen_core_edited=`{gate['frozen_core_edited']}`.
 - Production config değiştirilmedi; accuracy/F1/IoU iddiası yok.
 
-# Kalan Riskler
+## 6. Kalan Riskler
 
 - Baskın sınıflandırma `mixed_source_selection_geometry_insufficient_intent`; Topology Engine defect kanıtlanmış değildir.
 - Coordinate-bearing artifacts yalnız ignored `outputs/tq02/proje` altında tutulur; rollback atomik önceki paket geri yüklemesidir.
@@ -465,9 +640,49 @@ def _write_csv(path: Path, dangling: list[dict]) -> None:
             writer.writerow({key: item.get(key) for key in fields})
 
 
-def publish_package(run: dict, output_dir: Path, tolerance: dict | None = None) -> dict:
+def _write_component_matrix(path: Path, components: list[dict]) -> None:
+    fields = ("stable_id", "component_id", "node_count", "edge_count", "loop_count", "dangling_count", "layer", "block", "entity_type", "attributed_count")
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n")
+        writer.writeheader()
+        for component in components:
+            tuples = component["provenance_tuple_counts"] or [
+                {"layer": "UNKNOWN", "block": "UNKNOWN", "entity_type": "UNKNOWN", "count": 0}
+            ]
+            for provenance_tuple in tuples:
+                writer.writerow({
+                    "stable_id": component["stable_id"],
+                    "component_id": component["component_id"],
+                    "node_count": component["node_count"],
+                    "edge_count": component["edge_count"],
+                    "loop_count": component["loop_count"],
+                    "dangling_count": len(component["dangling_node_ids"]),
+                    "layer": provenance_tuple["layer"],
+                    "block": provenance_tuple["block"],
+                    "entity_type": provenance_tuple["entity_type"],
+                    "attributed_count": provenance_tuple["count"],
+                })
+
+
+def _write_ground_truth_review(path: Path, dangling: list[dict]) -> None:
+    fields = ("node_id", "component_id", "x", "y", "classification", "layer", "block", "entity_type", "review_label", "reviewer", "review_notes")
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n")
+        writer.writeheader()
+        for item in dangling:
+            provenance = item["provenance"]
+            writer.writerow({**{key: item.get(key, "") for key in fields}, "layer": provenance.get("layer", "UNKNOWN"), "block": provenance.get("block", "UNKNOWN"), "entity_type": provenance.get("entity_type", "UNKNOWN")})
+
+
+def publish_package(
+    run: dict,
+    output_dir: Path,
+    tolerance: dict | None = None,
+    repeat_run: dict | None = None,
+    layer_ablation_result: dict | None = None,
+) -> dict:
     output_dir = validate_output_dir(output_dir)
-    gate = evaluate_core_fix_gate()
+    gate = evaluate_core_fix_gate(run, repeat_run)
     matrix = evidence_matrix(run, gate)
     tolerance = tolerance or {"status": "NOT_EXECUTED_IN_SYNTHETIC_PACKAGE"}
     classifications = Counter(item["classification"] for item in run["dangling"])
@@ -492,18 +707,24 @@ def publish_package(run: dict, output_dir: Path, tolerance: dict | None = None) 
         "classification": "mixed_source_selection_geometry_insufficient_intent",
         "topology_defect_proven": False,
         "constraint_contribution": run["constraint"]["contribution"],
-        "validator_mismatch_supported": False,
+        "validator_invariant_mismatch": "NOT_EVALUATED_INSUFFICIENT_GROUND_TRUTH",
         "classification_counts": dict(sorted(classifications.items())),
         "conditional_core_fix_gate": gate,
     }
     with tempfile.TemporaryDirectory(prefix="karar-tq02-package-") as temp_dir:
         staging = Path(temp_dir)
+        investigated_components = component_investigation(run)
         write_json(staging / "baseline_comparison.json", baseline)
-        write_json(staging / "component_inventory.json", {"count": len(run["components"]), "components": run["components"]})
+        write_json(staging / "component_inventory.json", {"count": len(investigated_components), "components": investigated_components})
+        _write_component_matrix(staging / "component_layer_matrix.csv", investigated_components)
         write_json(staging / "dangling_nodes.json", {"count": len(run["dangling"]), "nodes": run["dangling"]})
         _write_csv(staging / "dangling_nodes.csv", run["dangling"])
         write_json(staging / "provenance_inventory.json", provenance_inventory(run["dangling"]))
-        write_json(staging / "selection_experiments.json", selection_experiments(run["raw"], run["walls"], run["dangling"]))
+        selection = selection_experiments(run["raw"], run["walls"], run["dangling"])
+        selection["layer_topology_ablation"] = layer_ablation_result or {
+            "status": "NOT_EXECUTED_IN_SYNTHETIC_PACKAGE"
+        }
+        write_json(staging / "selection_experiments.json", selection)
         write_json(staging / "tolerance_sensitivity.json", tolerance)
         write_json(staging / "evidence_matrix.json", {"matrix": matrix})
         write_json(staging / "root_cause_summary.json", root_cause)
@@ -511,11 +732,24 @@ def publish_package(run: dict, output_dir: Path, tolerance: dict | None = None) 
             topology_svg(run["graph"], run["dangling"], run["node_to_component"]), encoding="utf-8", newline="\n"
         )
         (staging / "dangling_candidates.svg").write_text(candidate_svg(run["graph"], run["dangling"]), encoding="utf-8", newline="\n")
+        largest = max(
+            investigated_components,
+            key=lambda item: (item["node_count"], item["edge_count"], item["stable_id"]),
+        )
+        (staging / "largest_component.svg").write_text(
+            _spatial_svg(
+                run["graph"], run["dangling"], "TQ-02 largest component",
+                set(largest["node_ids"]),
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        _write_ground_truth_review(staging / "ground_truth_review.csv", run["dangling"])
         (staging / "TQ02_ENGINEERING_REPORT.md").write_text(engineering_report(run, matrix, gate), encoding="utf-8", newline="\n")
         names = sorted(set(MANAGED_ARTIFACTS) - {"manifest.json"})
         manifest = {
-            "schema_version": "tq02-manifest-v1",
-            "status": "TQ-02_QUALIFIED_NO_CORE_FIX",
+            "schema_version": "tq02-manifest-v2",
+            "status": "TQ02_AWAITING_HUMAN_GROUND_TRUTH",
             "source": run["source"], "counts": run["counts"],
             "baseline_locked": baseline["locked_baseline_equal"],
             "validator": run["validator"], "downstream_instantiated": False,
@@ -578,7 +812,14 @@ def run_diagnostics(source: Path, output_dir: Path) -> dict:
     tolerance = tolerance_experiments(run_a["walls"])
     if not all(item["deterministic"] for item in tolerance["bands"]):
         raise RuntimeError("Tolerance ablation is not deterministic")
-    return publish_package(run_a, output_dir, tolerance)
+    ablation = layer_ablation(run_a["walls"])
+    return publish_package(
+        run_a,
+        output_dir,
+        tolerance,
+        repeat_run=run_b,
+        layer_ablation_result=ablation,
+    )
 
 
 def parse_args() -> argparse.Namespace:
