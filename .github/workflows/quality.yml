@@ -42,4 +42,5 @@ jobs:
 
       - name: "QG-1 & QG-3: Python Regression Tests & Domain Hash Check"
         run: |
+          PYTHONPATH=. python3 -m unittest discover -s backend/tests -p "test_*.py"
           PYTHONPATH=. python3 backend/run_regression_tests.py
