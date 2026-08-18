@@ -15,6 +15,8 @@
 - `outputs/topology_validation_proje.json:4-18` mandatory `TopologyValidator` sonucunu `FAIL` olarak kaydediyor. `outputs/topology_health_proje.json` 478 connected component gösteriyor ve şu kontroller `false`: `single_connected_component`, `no_dangling_nodes`, `no_tiny_loops`, `no_tiny_sliver_faces`. Tiny loop kimlikleri `[0, 1, 2]`.
 - Odaklı regresyon komutu `python -m pytest backend/tests/test_run_real_field_validation.py backend/tests/test_topology_validator.py backend/tests/test_topology_engine_determinism.py -q` sonucu: `44 passed, 7 subtests passed in 1.91s`.
 - `outputs/` içinde `proje` adına bağlı yalnız `topology_health_proje.json` ve `topology_validation_proje.json` bulunuyor. RV-02'ye özgü Canonical BIM, P2, Blender, GLB, OBJ veya render artifact'i üretilmedi.
+- GitHub üzerinden bağımsız doğrulanabilen kanıt sınırı; `phase1/rv-02-real-project-vertical-slice` branch'i, `main` tabanı `22b82f642bc3baa5a2095f93b239de972edc1192`, RV-02 implementation commit'i `80d2f43e2e84ac0140aa2011df016d083be3f81d`, üç dosyalı PR diff'i, committed testler ve `Required CI - Lint, Regression & Domain Hash` job'ının `32171391858` run / `95823132620` job sonucudur (`COMPLETED/SUCCESS`).
+- Intake ayrıntıları, Geometry/Topology deterministik hash'leri ve 478 bileşenli topology bulguları ise SHA-256 `289b586570f0d915cae1707ccb234b84bd0527bd1412189b5b238811aa9a721c` olan yerel ve uncommitted authoritative `data/proje.dxf` koşusuna bağlı yerel-run kanıtıdır. Authoritative DXF ile generated validator JSON dosyaları kasıtlı olarak PR kapsamına alınmadığından bu 478-component koşusu yalnız GitHub checkout'u kullanılarak bağımsız biçimde yeniden çalıştırılamaz.
 
 ## 2. Risk Analizi
 
@@ -29,7 +31,7 @@
 - Dangling endpoint dağılımı ile Geometry Engine snapping/short-segment kararları karşılaştırılmalı; yalnız ölçülebilir ground-truth veya regression fixture kanıtı bulunan tolerans/algoritma değişiklikleri önerilmelidir.
 - Tiny loop `[0, 1, 2]` ve sliver yüzler, kaynak entity lineage'ı korunarak minimal reproducer'lara indirgenmelidir. Çözüm Parser → Geometry → Topology sınırlarını ve Canonical BIM SSoT sözleşmesini korumalıdır.
 - Canonical BIM/P2 ve tüm 3D consumer'lar ancak aynı yetkili kaynakla mandatory topology validation `PASS` olduktan sonra çalıştırılmalıdır.
-- Öncelik sorusunun yanıtı **EVET**: explicit source injection, yasaklı fixture'ın yanlışlıkla seçilmesini engelleyerek gerçek kaynak doğrulamasının tekrarlanabilirliğini ve traceability'sini ölçülebilir biçimde artırıyor; focused test exact path aktarımını kanıtlıyor. Bu değişiklik topoloji kusurlarını çözmez ve öyle sunulmamaktadır.
+- Öncelik sorusunun yanıtı **HAYIR**: Production Geometry Engine, Topology Engine ve Canonical BIM davranışı değiştirilmedi. Explicit source injection runner güvenliğini, tekrarlanabilirliğini ve izlenebilirliğini iyileştirir; ancak bu çekirdek modüllerin doğruluğunu, determinizmini, sağlamlığını veya performansını ölçülebilir biçimde artırmaz. Focused test exact path aktarımını kanıtlar; değişiklik topoloji kusurlarını çözmez ve öyle sunulmamaktadır.
 
 ## 4. Uygulanan Değişiklik
 
