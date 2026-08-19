@@ -1,0 +1,9 @@
+# Direct runtime dependencies for the Python 3.10 baseline.
+ezdxf==1.4.4
+Shapely==2.1.2
+Rtree==1.4.1
+numpy==1.26.4
+scikit-learn==1.7.2
+matplotlib==3.8.4
+trimesh==5.0.0
+ifcopenshell==0.8.5
