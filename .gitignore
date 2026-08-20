@@ -10,3 +10,10 @@ logs/
 outputs/
 .kaRar/
 .tmp.driveupload/
+
+# Repository-local tooling, caches, and generated maintenance artifacts
+/cline/
+/.vite/
+/backend.zip
+/backend.rar
+/.cline-reset-log.txt
