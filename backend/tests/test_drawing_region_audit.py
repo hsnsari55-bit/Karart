@@ -344,6 +344,129 @@ class TestDrawingRegionAudit(unittest.TestCase):
         self.assertTrue(all(set(item["configured_tolerances_unchanged"]) == {"snap_tolerance_mm", "min_segment_length_mm"} for item in qualification))
         self.assertTrue(all(item["status"] in {"VALIDATOR_PASS", "VALIDATOR_FAIL"} for item in qualification))
 
+    def test_floor_qualification_default_preserves_legacy_baseline_shape(self):
+        entities = complete_source_view_catalog()
+        source_views = self.audit.build_source_views(entities)
+
+        qualification = self.audit.qualify_floor_topology(source_views, entities)
+
+        self.assertEqual(len(qualification), 8)
+        self.assertTrue(all("baseline" not in item for item in qualification))
+        self.assertTrue(all("candidate" not in item for item in qualification))
+
+    def test_candidate_handoff_uses_exact_assigned_source_entities_and_preserves_physical_graph(self):
+        entities = complete_source_view_catalog()
+        source_views = self.audit.build_source_views(entities)
+        entity_by_id = {entity.source_id: entity for entity in entities}
+        captured_sources = []
+
+        def capture_generation(_graph, sources, tolerance_mm=5.0):
+            captured_sources.append(list(sources))
+            return {"logical_connectors": [], "rejections": []}
+
+        with mock.patch(
+            "backend.transient_boundary_connectors.generate_logical_connectors",
+            side_effect=capture_generation,
+        ):
+            qualification = self.audit.qualify_floor_topology(
+                source_views, entities, include_transient_connectors=True
+            )
+
+        floor_views = sorted(
+            (view for view in source_views["views"] if view["drawing_type"] == "FLOOR_PLAN"),
+            key=lambda view: view["view_id"],
+        )
+        captured_by_ids = sorted(
+            ([entity.source_id for entity in sources] for sources in captured_sources)
+        )
+        expected_by_ids = sorted(
+            ([source_id for source_id in view["assigned_entity_ids"] if source_id in entity_by_id]
+             for view in floor_views)
+        )
+        self.assertEqual(captured_by_ids, expected_by_ids)
+        self.assertEqual(len(qualification), 8)
+        self.assertTrue(all(item["candidate"]["physical_graph_unchanged"] for item in qualification))
+        self.assertTrue(all(item["candidate"]["logical_connectors"] == [] for item in qualification))
+        self.assertTrue(all("logical_connectors" not in item["baseline"] for item in qualification))
+
+    def test_candidate_qualification_is_source_permutation_deterministic(self):
+        entities = complete_source_view_catalog()
+        source_views = self.audit.build_source_views(entities)
+
+        first = self.audit.qualify_floor_topology(
+            source_views, entities, include_transient_connectors=True
+        )
+        second = self.audit.qualify_floor_topology(
+            source_views, list(reversed(entities)), include_transient_connectors=True
+        )
+
+        self.assertEqual(first, second)
+        self.assertTrue(all(item["baseline"]["snapshot_sha256"] for item in first))
+        self.assertTrue(all(item["candidate"]["snapshot_sha256"] for item in first))
+
+    def test_candidate_qualification_keeps_baseline_physical_and_candidate_effective_health_separate(self):
+        entities = complete_source_view_catalog()
+        source_views = self.audit.build_source_views(entities)
+        observed_graph_keys = []
+
+        def health_report(graph):
+            observed_graph_keys.append(set(graph))
+            candidate = "logical_connectors" in graph
+            return {
+                "timestamp": "ignored",
+                "status": "WARNING",
+                "counts": {
+                    "nodes": 10,
+                    "edges": 8,
+                    "loops": 0,
+                    **({"physical_edges": 8, "logical_connectors": 2, "effective_edges": 10} if candidate else {}),
+                },
+                "graph_metrics": {
+                    "connected_components": 3 if candidate else 4,
+                    "dangling_node_count": 2 if candidate else 6,
+                },
+                "loop_metrics": {},
+                "checks": {},
+                "issues": [],
+                "diagnostics": [],
+            }
+
+        with mock.patch(
+            "backend.transient_boundary_connectors.generate_logical_connectors",
+            return_value={"logical_connectors": [], "rejections": []},
+        ), mock.patch(
+            "backend.topology_health_report.TopologyHealthReporter.build_report",
+            autospec=True,
+            side_effect=lambda _reporter, graph: health_report(graph),
+        ):
+            qualification = self.audit.qualify_floor_topology(
+                source_views, entities, include_transient_connectors=True
+            )
+
+        self.assertEqual(len(observed_graph_keys), 16)
+        self.assertTrue(all("logical_connectors" not in keys for keys in observed_graph_keys[0::2]))
+        self.assertTrue(all("logical_connectors" in keys for keys in observed_graph_keys[1::2]))
+        self.assertTrue(all(item["baseline"]["health"]["graph_metrics"]["connected_components"] == 4 for item in qualification))
+        self.assertTrue(all(item["baseline"]["health"]["graph_metrics"]["dangling_node_count"] == 6 for item in qualification))
+        self.assertTrue(all(item["candidate"]["health"]["graph_metrics"]["connected_components"] == 3 for item in qualification))
+        self.assertTrue(all(item["candidate"]["health"]["graph_metrics"]["dangling_node_count"] == 2 for item in qualification))
+        self.assertTrue(all("timestamp" not in item["candidate"]["health"] for item in qualification))
+
+    def test_build_report_enables_transient_connector_candidate_qualification(self):
+        entities = complete_source_view_catalog()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source.dxf"
+            source.write_bytes(b"read-only-test-source")
+            with mock.patch.object(
+                self.audit, "qualify_floor_topology", return_value=[]
+            ) as qualify:
+                self.audit.build_report(source, entities, {"normalized_unit": "mm"})
+
+        source_views = self.audit.build_source_views(entities)
+        qualify.assert_called_once_with(
+            source_views, entities, include_transient_connectors=True
+        )
+
     def test_geometry_adapter_preserves_actual_assigned_sources_without_fallback(self):
         entities = {
             "actual-line": line("actual-line", 10, 20, 30, 40),

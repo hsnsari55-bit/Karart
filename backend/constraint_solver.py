@@ -4,6 +4,7 @@ import os
 from typing import Dict, Any
 
 from backend.path_manager import PathManager
+from backend.transient_boundary_connectors import validate_logical_connectors
 
 class ConstraintSolver:
     """
@@ -85,6 +86,22 @@ class ConstraintSolver:
             "initial_edge_count": len(edges),
             "resolved_edge_count": len(resolved_edges)
         }
+
+        if "logical_connectors" in graph:
+            logical_connectors = graph.get("logical_connectors") or []
+            resolved_connectors, connector_rejections = validate_logical_connectors(
+                nodes,
+                resolved_edges,
+                logical_connectors,
+            )
+            resolved_graph.update(
+                {
+                    "logical_connectors": resolved_connectors,
+                    "logical_connector_rejections": connector_rejections,
+                    "initial_logical_connector_count": len(logical_connectors),
+                    "resolved_logical_connector_count": len(resolved_connectors),
+                }
+            )
 
         output_path = self.path_manager.get_path("outputs", self.RESOLVED_GRAPH_FILENAME)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)

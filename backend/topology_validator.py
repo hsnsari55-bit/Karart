@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from typing import Dict, Any, List, Tuple, Optional
 
 from backend.path_manager import PathManager
+from backend.transient_boundary_connectors import validate_logical_connectors
 
 class TopologyValidationError(Exception):
     pass
@@ -69,6 +70,7 @@ class TopologyValidator:
         nodes: List[Dict[str, Any]],
         edges: List[Dict[str, Any]],
         loops: List[Dict[str, Any]],
+        logical_connectors: Optional[List[Dict[str, Any]]] = None,
         error: Optional[str] = None,
     ) -> Dict[str, Any]:
         report = {
@@ -89,6 +91,12 @@ class TopologyValidator:
                 "non_empty_loops": len(loops) > 0,
             },
         }
+        if logical_connectors is not None:
+            report["counts"].update({
+                "physical_edges": len(edges),
+                "logical_connectors": len(logical_connectors),
+                "effective_edges": len(edges) + len(logical_connectors),
+            })
         if error is not None:
             report["error"] = error
         return report
@@ -274,6 +282,7 @@ class TopologyValidator:
         self,
         nodes: List[Dict[str, Any]],
         edges: List[Dict[str, Any]],
+        logical_connectors: Optional[List[Dict[str, Any]]] = None,
     ):
         node_ids = [self._parse_node_id(node, index=index) for index, node in enumerate(nodes)]
         if not node_ids:
@@ -287,6 +296,11 @@ class TopologyValidator:
                 raise TopologyValidationError(
                     f"Topology validation failed: Edge {edge_id} references missing node ids."
                 )
+            adjacency[from_id].add(to_id)
+            adjacency[to_id].add(from_id)
+
+        for connector in logical_connectors or []:
+            from_id, to_id = int(connector["from"]), int(connector["to"])
             adjacency[from_id].add(to_id)
             adjacency[to_id].add(from_id)
 
@@ -375,6 +389,9 @@ class TopologyValidator:
         nodes = graph.get("nodes", [])
         edges = graph.get("edges", [])
         loops = graph.get("loops", [])
+        has_logical_connector_evidence = "logical_connectors" in graph
+        raw_logical_connectors = graph.get("logical_connectors", []) or []
+        valid_logical_connectors: List[Dict[str, Any]] = []
 
         try:
             if not nodes:
@@ -388,10 +405,27 @@ class TopologyValidator:
             computed_degrees = self._compute_node_degrees(nodes, edges)
             edge_lookup = self._build_edge_coord_lookup(edges, node_coords)
 
+            if has_logical_connector_evidence:
+                valid_logical_connectors, connector_rejections = validate_logical_connectors(
+                    nodes,
+                    edges,
+                    raw_logical_connectors,
+                )
+                if connector_rejections:
+                    raise TopologyValidationError(
+                        "Topology validation failed: Invalid logical connectors "
+                        f"{connector_rejections}."
+                    )
+
             self._validate_node_degree_metadata(nodes, computed_degrees)
-            self._validate_no_dangling_nodes(computed_degrees)
+            effective_degrees = dict(computed_degrees)
+            for connector in valid_logical_connectors:
+                from_id, to_id = int(connector["from"]), int(connector["to"])
+                effective_degrees[from_id] += 1
+                effective_degrees[to_id] += 1
+            self._validate_no_dangling_nodes(effective_degrees)
             self._validate_no_self_loop_or_duplicate_edges(edges)
-            self._validate_single_connected_component(nodes, edges)
+            self._validate_single_connected_component(nodes, edges, valid_logical_connectors)
             self._validate_loops(
                 loops,
                 {self._parse_edge_id(edge, index=index) for index, edge in enumerate(edges)},
@@ -403,6 +437,7 @@ class TopologyValidator:
                 nodes=nodes,
                 edges=edges,
                 loops=loops,
+                logical_connectors=(valid_logical_connectors if has_logical_connector_evidence else None),
             )
             report["checks"].update({
                 "node_reference_integrity": True,
@@ -420,6 +455,8 @@ class TopologyValidator:
                 "no_tiny_sliver_faces": True,
                 "face_edge_consistency": True,
             })
+            if has_logical_connector_evidence:
+                report["checks"]["logical_connector_integrity"] = True
             self._write_report(report)
 
             self.logger.info(
@@ -432,6 +469,7 @@ class TopologyValidator:
                 nodes=nodes,
                 edges=edges,
                 loops=loops,
+                logical_connectors=(valid_logical_connectors if has_logical_connector_evidence else None),
                 error=str(exc),
             )
             self._write_report(report)

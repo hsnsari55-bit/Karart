@@ -396,6 +396,100 @@ class TestTopologyValidator(unittest.TestCase):
         self.assertEqual(report["status"], "FAIL")
         self.assertIn("contains invalid edge reference", report["error"])
 
+    def test_logical_connector_closes_effective_topology_without_changing_physical_integrity(self):
+        graph = {
+            **self.valid_graph,
+            "nodes": [
+                *self.valid_graph["nodes"],
+                {"id": 4, "x": 20.0, "y": 0.0, "degree": 1, "type": "endpoint"},
+                {"id": 5, "x": 20.0, "y": 10.0, "degree": 1, "type": "endpoint"},
+            ],
+            "edges": [
+                *self.valid_graph["edges"],
+                {"id": 4, "from": 4, "to": 5, "length": 10.0, "angle": 90.0},
+            ],
+            "logical_connectors": [
+                {
+                    "id": "ag04-validator-valid-a",
+                    "role": "DOOR_PORTAL",
+                    "physical": False,
+                    "from": 1,
+                    "to": 4,
+                    "host_edge_ids": [1, 4],
+                    "source_primitive_id": "door-source-a",
+                    "source_layer_normalized": "kapi",
+                    "evidence_class": "EXACT_SOURCE_SPAN_WITH_TWO_UNIQUE_PARALLEL_HOSTS",
+                    "length_mm": 10.0,
+                },
+                {
+                    "id": "ag04-validator-valid-b",
+                    "role": "WINDOW_OPENING",
+                    "physical": False,
+                    "from": 2,
+                    "to": 5,
+                    "host_edge_ids": [2, 4],
+                    "source_primitive_id": "window-source-b",
+                    "source_layer_normalized": "pencere",
+                    "evidence_class": "EXACT_SOURCE_SPAN_WITH_TWO_UNIQUE_PARALLEL_HOSTS",
+                    "length_mm": 10.0,
+                },
+            ],
+        }
+
+        physical_edges_before = [dict(edge) for edge in graph["edges"]]
+        self.assertTrue(self.validator.validate(graph))
+
+        with open(self.report_path, "r", encoding="utf-8") as f:
+            report = json.load(f)
+        self.assertEqual(graph["edges"], physical_edges_before)
+        self.assertEqual(report["counts"]["edges"], 5)
+        self.assertEqual(report["counts"]["physical_edges"], 5)
+        self.assertEqual(report["counts"]["logical_connectors"], 2)
+        self.assertEqual(report["counts"]["effective_edges"], 7)
+        self.assertTrue(report["checks"]["logical_connector_integrity"])
+
+    def test_malformed_logical_connector_fails_before_effective_projection(self):
+        graph = {
+            **self.valid_graph,
+            "logical_connectors": [
+                {
+                    "id": "ag04-validator-invalid",
+                    "role": "DOOR_PORTAL",
+                    "physical": True,
+                    "from": 0,
+                    "to": 1,
+                    "host_edge_ids": [0, 1],
+                    "source_primitive_id": "door-source",
+                    "source_layer_normalized": "kapi",
+                    "evidence_class": "EXACT_SOURCE_SPAN_WITH_TWO_UNIQUE_PARALLEL_HOSTS",
+                    "length_mm": 10.0,
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(TopologyValidationError, "CONNECTOR_MUST_BE_NON_PHYSICAL"):
+            self.validator.validate(graph)
+
+        with open(self.report_path, "r", encoding="utf-8") as f:
+            report = json.load(f)
+        self.assertEqual(report["status"], "FAIL")
+        self.assertEqual(report["counts"]["edges"], 4)
+        self.assertEqual(report["counts"]["physical_edges"], 4)
+        self.assertEqual(report["counts"]["logical_connectors"], 0)
+        self.assertEqual(report["counts"]["effective_edges"], 4)
+        self.assertIn(
+            "{'connector_id': 'ag04-validator-invalid', 'reason': 'CONNECTOR_MUST_BE_NON_PHYSICAL'}",
+            report["error"],
+        )
+
+    def test_no_connector_evidence_preserves_legacy_report_shape(self):
+        self.assertTrue(self.validator.validate(self.valid_graph))
+
+        with open(self.report_path, "r", encoding="utf-8") as f:
+            report = json.load(f)
+        self.assertEqual(report["counts"], {"nodes": 4, "edges": 4, "loops": 1})
+        self.assertNotIn("logical_connector_integrity", report["checks"])
+
 
 if __name__ == "__main__":
     unittest.main()

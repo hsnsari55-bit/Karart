@@ -638,6 +638,81 @@ class TestRegressionBIMCoreOpeningParentWall(unittest.TestCase):
                 _strip_volatile_provenance_fields(second_model),
             )
 
+    def test_transient_logical_connectors_are_excluded_from_canonical_bim_and_domain_hash(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            semantics_path = os.path.join(temp_dir, "bim_semantics.json")
+            spaces_path = os.path.join(temp_dir, "spaces.json")
+
+            with open(semantics_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "elements": [
+                            {
+                                "uuid": "wall-semantic-1",
+                                "type": "Wall",
+                                "geometry": {
+                                    "points": [[0.0, 0.0], [10.0, 0.0]],
+                                    "length": 10.0,
+                                },
+                                "edge_id": 1,
+                            }
+                        ]
+                    },
+                    f,
+                    indent=2,
+                )
+
+            with open(spaces_path, "w", encoding="utf-8") as f:
+                json.dump({"spaces": []}, f, indent=2)
+
+            physical_graph = {
+                "nodes": [
+                    {"id": 0, "x": 0.0, "y": 0.0},
+                    {"id": 1, "x": 10.0, "y": 0.0},
+                ],
+                "edges": [{"id": 1, "from": 0, "to": 1}],
+                "loops": [],
+            }
+            candidate_graph = json.loads(json.dumps(physical_graph))
+            candidate_graph["logical_connectors"] = [
+                {
+                    "id": "transient-connector-must-not-persist",
+                    "type": "door",
+                    "from": 0,
+                    "to": 1,
+                    "physical": False,
+                }
+            ]
+
+            engine = BIMCoreEngine()
+            engine.path_manager = _StubPathManager(temp_dir)
+
+            baseline_model = engine.run(graph_data=physical_graph)
+            candidate_model = engine.run(graph_data=candidate_graph)
+
+            domain_keys = ("spaces", "walls", "windows", "columns", "doors")
+            self.assertEqual(
+                {key: baseline_model[key] for key in domain_keys},
+                {key: candidate_model[key] for key in domain_keys},
+            )
+            self.assertEqual(
+                baseline_model["provenance"]["canonical_bim_sha256"],
+                candidate_model["provenance"]["canonical_bim_sha256"],
+            )
+            self.assertEqual(
+                candidate_model["provenance"]["canonical_bim_sha256"],
+                _domain_hash_v1(candidate_model),
+            )
+            self.assertNotEqual(
+                baseline_model["provenance"]["input_hashes"]["geometry_graph_sha256"],
+                candidate_model["provenance"]["input_hashes"]["geometry_graph_sha256"],
+            )
+            self.assertNotIn("logical_connectors", candidate_model)
+            self.assertNotIn(
+                "transient-connector-must-not-persist",
+                json.dumps(candidate_model, sort_keys=True),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
