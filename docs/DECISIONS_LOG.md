@@ -52,3 +52,13 @@ Bu dosya, tekrar aynı tartışmaları yapmamak ve daha önce alınmış teknik 
 - Etkilenen dosyalar: `backend/topology_health_report.py`, `backend/run_regression_tests.py`, `backend/tests/test_topology_health_report.py`, `backend/tests/test_regression_topology_report_path.py`, `docs/algorithm-state/topology_engine.md`
 - İlgili test/komut: `python -m unittest backend.tests.test_topology_health_report backend.tests.test_regression_topology_report_path`
 - Takip notu: sonraki oturumda validator ile health report arasındaki bir sonraki kapsama farkı yine tek regression test + minimal değişiklik yaklaşımıyla seçilmeli.
+
+### [2026-08-22] AG-04 boundary connector'ları transient ve non-physical kalacak
+- Durum: Accepted
+- Bağlam: Kapı/pencere açıklıkları fiziksel duvar edge'i üretmeden topology sürekliliğine katkı sağlamalı; aksi halde wall/loop/mesh ve Canonical BIM sözleşmesi bozulur.
+- Karar: Typed boundary connector'ları ayrı `logical_connectors` koleksiyonunda, `physical: false` ve fail-closed üretim/doğrulama ile tutulacak; yalnız effective degree/component/dangling hesabına katılacak, fiziksel `nodes/edges/loops`, Canonical BIM ve Domain Hash v1 dışında kalacak.
+- Gerekçe: Fiziksel geometriyi değiştirmeden ölçülebilir topology sürekliliği sağlar ve downstream consumer'ların tek gerçek kaynağı olan Canonical BIM'i transient audit kanıtından ayırır.
+- Kanıt: `backend/transient_boundary_connectors.py`, `backend/drawing_region_audit.py`, `DOMAIN_HASH_SPEC.md`
+- Etkilenen dosyalar: `backend/constraint_solver.py`, `backend/topology_health_report.py`, `backend/topology_validator.py`, `backend/drawing_region_audit.py`
+- İlgili test/komut: `python -m unittest backend.tests.test_transient_boundary_connectors backend.tests.test_constraint_solver backend.tests.test_topology_health_report backend.tests.test_topology_validator backend.tests.test_drawing_region_audit backend.tests.test_regression_bim_core_opening_parent_wall`
+- Takip notu: Connector'ların physical topology veya Canonical BIM'e persist edilmesi ya da Domain Hash v1 payload'ına eklenmesi sözleşme ihlalidir; yeni BIM entity ihtiyacı ayrı schema/hash spec kararı gerektirir.

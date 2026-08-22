@@ -189,6 +189,93 @@ class TestConstraintSolver(unittest.TestCase):
             self.assertEqual(resolved["edges"][1]["to"], 99)
             self.assertEqual(resolved["edges"][2]["from"], 42)
 
+    def test_run_keeps_logical_connectors_separate_from_physical_edges(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            solver = self._make_solver(os.path.join(temp_dir, "resolved.json"))
+            physical_edges = [
+                {"id": 10, "from": 0, "to": 1},
+                {"id": 11, "from": 2, "to": 3},
+            ]
+            connector = {
+                "id": "ag04-valid",
+                "role": "DOOR_PORTAL",
+                "physical": False,
+                "from": 1,
+                "to": 2,
+                "host_edge_ids": [10, 11],
+                "source_primitive_id": "door-source",
+                "source_layer_normalized": "kapi",
+                "evidence_class": "EXACT_SOURCE_SPAN_WITH_TWO_UNIQUE_PARALLEL_HOSTS",
+                "length_mm": 10.0,
+            }
+
+            resolved = solver.run(
+                {
+                    "nodes": [
+                        {"id": 0, "x": 0.0, "y": 0.0},
+                        {"id": 1, "x": 10.0, "y": 0.0},
+                        {"id": 2, "x": 20.0, "y": 0.0},
+                        {"id": 3, "x": 30.0, "y": 0.0},
+                    ],
+                    "edges": physical_edges,
+                    "loops": [],
+                    "logical_connectors": [connector],
+                }
+            )
+
+            self.assertEqual(resolved["edges"], physical_edges)
+            self.assertEqual(resolved["initial_edge_count"], 2)
+            self.assertEqual(resolved["resolved_edge_count"], 2)
+            self.assertEqual(resolved["logical_connectors"], [connector])
+            self.assertEqual(resolved["logical_connector_rejections"], [])
+            self.assertEqual(resolved["initial_logical_connector_count"], 1)
+            self.assertEqual(resolved["resolved_logical_connector_count"], 1)
+
+    def test_run_rejects_malformed_logical_connector_without_changing_edges(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            solver = self._make_solver(os.path.join(temp_dir, "resolved.json"))
+            graph = {
+                "nodes": [{"id": 0}, {"id": 1}],
+                "edges": [{"id": 10, "from": 0, "to": 1}],
+                "loops": [],
+                "logical_connectors": [
+                    {
+                        "id": "ag04-invalid",
+                        "role": "DOOR_PORTAL",
+                        "physical": True,
+                        "from": 0,
+                        "to": 1,
+                    }
+                ],
+            }
+
+            resolved = solver.run(graph)
+
+            self.assertEqual(resolved["edges"], graph["edges"])
+            self.assertEqual(resolved["logical_connectors"], [])
+            self.assertEqual(
+                resolved["logical_connector_rejections"],
+                [{"connector_id": "ag04-invalid", "reason": "CONNECTOR_MUST_BE_NON_PHYSICAL"}],
+            )
+            self.assertEqual(resolved["initial_logical_connector_count"], 1)
+            self.assertEqual(resolved["resolved_logical_connector_count"], 0)
+
+    def test_run_without_logical_connector_evidence_preserves_legacy_shape(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            solver = self._make_solver(os.path.join(temp_dir, "resolved.json"))
+            resolved = solver.run(
+                {
+                    "nodes": [{"id": 0}, {"id": 1}],
+                    "edges": [{"id": 10, "from": 0, "to": 1}],
+                    "loops": [],
+                }
+            )
+
+            self.assertNotIn("logical_connectors", resolved)
+            self.assertNotIn("logical_connector_rejections", resolved)
+            self.assertNotIn("initial_logical_connector_count", resolved)
+            self.assertNotIn("resolved_logical_connector_count", resolved)
+
 
 if __name__ == "__main__":
     unittest.main()

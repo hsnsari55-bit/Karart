@@ -841,6 +841,116 @@ class TestTopologyHealthReporter(unittest.TestCase):
         self.assertIn("OPEN_LOOPS", [diagnostic["code"] for diagnostic in report["diagnostics"]])
         self.assertIn("TINY_LOOPS", [diagnostic["code"] for diagnostic in report["diagnostics"]])
 
+    def test_logical_connector_improves_only_effective_connectivity_metrics(self):
+        graph = {
+            "nodes": [
+                {"id": 0, "x": 0.0, "y": 0.0, "degree": 1},
+                {"id": 1, "x": 10.0, "y": 0.0, "degree": 1},
+                {"id": 2, "x": 20.0, "y": 0.0, "degree": 1},
+                {"id": 3, "x": 30.0, "y": 0.0, "degree": 1},
+            ],
+            "edges": [
+                {"id": 10, "from": 0, "to": 1},
+                {"id": 11, "from": 2, "to": 3},
+            ],
+            "loops": [],
+            "logical_connectors": [
+                {
+                    "id": "ag04-reporter-valid",
+                    "role": "DOOR_PORTAL",
+                    "physical": False,
+                    "from": 1,
+                    "to": 2,
+                    "host_edge_ids": [10, 11],
+                    "source_primitive_id": "door-source",
+                    "source_layer_normalized": "kapi",
+                    "evidence_class": "EXACT_SOURCE_SPAN_WITH_TWO_UNIQUE_PARALLEL_HOSTS",
+                    "length_mm": 10.0,
+                }
+            ],
+        }
+
+        report = self.reporter.build_report(graph)
+
+        self.assertEqual(report["counts"]["edges"], 2)
+        self.assertEqual(report["counts"]["physical_edges"], 2)
+        self.assertEqual(report["counts"]["logical_connectors"], 1)
+        self.assertEqual(report["counts"]["effective_edges"], 3)
+        self.assertEqual(report["graph_metrics"]["connected_components"], 1)
+        self.assertEqual(report["graph_metrics"]["dangling_node_ids"], [0, 3])
+        self.assertEqual(report["graph_metrics"]["degree_histogram"], {"1": 4})
+        self.assertEqual(report["graph_metrics"]["physical_degree_histogram"], {"1": 4})
+        self.assertEqual(
+            report["graph_metrics"]["effective_degree_histogram"],
+            {"1": 2, "2": 2},
+        )
+        self.assertTrue(report["checks"]["logical_connector_integrity"])
+        self.assertEqual(report["graph_metrics"]["logical_connector_rejections"], [])
+        self.assertEqual(graph["edges"], [{"id": 10, "from": 0, "to": 1}, {"id": 11, "from": 2, "to": 3}])
+
+    def test_malformed_logical_connector_is_critical_and_does_not_change_topology(self):
+        graph = {
+            "nodes": [
+                {"id": 0, "x": 0.0, "y": 0.0, "degree": 1},
+                {"id": 1, "x": 10.0, "y": 0.0, "degree": 1},
+                {"id": 2, "x": 20.0, "y": 0.0, "degree": 1},
+                {"id": 3, "x": 30.0, "y": 0.0, "degree": 1},
+            ],
+            "edges": [
+                {"id": 10, "from": 0, "to": 1},
+                {"id": 11, "from": 2, "to": 3},
+            ],
+            "loops": [],
+            "logical_connectors": [
+                {
+                    "id": "ag04-reporter-invalid",
+                    "role": "DOOR_PORTAL",
+                    "physical": True,
+                    "from": 1,
+                    "to": 2,
+                    "host_edge_ids": [10, 11],
+                    "source_primitive_id": "door-source",
+                    "source_layer_normalized": "kapi",
+                    "evidence_class": "EXACT_SOURCE_SPAN_WITH_TWO_UNIQUE_PARALLEL_HOSTS",
+                    "length_mm": 10.0,
+                }
+            ],
+        }
+
+        report = self.reporter.build_report(graph)
+
+        rejection = {
+            "connector_id": "ag04-reporter-invalid",
+            "reason": "CONNECTOR_MUST_BE_NON_PHYSICAL",
+        }
+        self.assertEqual(report["status"], "CRITICAL")
+        self.assertFalse(report["checks"]["logical_connector_integrity"])
+        self.assertEqual(report["counts"]["logical_connectors"], 0)
+        self.assertEqual(report["counts"]["effective_edges"], 2)
+        self.assertEqual(report["graph_metrics"]["connected_components"], 2)
+        self.assertEqual(report["graph_metrics"]["dangling_node_ids"], [0, 1, 2, 3])
+        self.assertEqual(report["graph_metrics"]["logical_connector_rejections"], [rejection])
+        self.assertEqual(report["diagnostics"][-1]["code"], "INVALID_LOGICAL_CONNECTORS")
+        self.assertEqual(report["diagnostics"][-1]["context"], {"rejections": [rejection]})
+
+    def test_no_connector_evidence_preserves_legacy_report_shape(self):
+        graph = {
+            "nodes": [
+                {"id": 0, "x": 0.0, "y": 0.0, "degree": 1},
+                {"id": 1, "x": 10.0, "y": 0.0, "degree": 1},
+            ],
+            "edges": [{"id": 10, "from": 0, "to": 1}],
+            "loops": [],
+        }
+
+        report = self.reporter.build_report(graph)
+
+        self.assertEqual(report["counts"], {"nodes": 2, "edges": 1, "loops": 0})
+        self.assertNotIn("logical_connector_integrity", report["checks"])
+        self.assertNotIn("physical_degree_histogram", report["graph_metrics"])
+        self.assertNotIn("effective_degree_histogram", report["graph_metrics"])
+        self.assertNotIn("logical_connector_rejections", report["graph_metrics"])
+
 
 if __name__ == "__main__":
     unittest.main()

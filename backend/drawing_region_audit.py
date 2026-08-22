@@ -9,6 +9,7 @@ deliberately fail-closed: uncertain candidates remain ``ambiguous`` for human re
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import hashlib
 import html
@@ -664,13 +665,63 @@ class DrawingRegionAudit:
             "tiny_sliver_loop_count": len(tiny), "tiny_sliver_loop_ids": tiny,
         }
 
-    def qualify_floor_topology(self, source_views: Dict[str, Any], entities: Sequence[AuditEntity]) -> List[Dict[str, Any]]:
-        """Run frozen Geometry, Topology and Validator stages in one isolated workspace per floor."""
+    @staticmethod
+    def _topology_snapshot(graph: Dict[str, Any], include_connectors: bool = False) -> Dict[str, Any]:
+        """Return the deterministic topology evidence subset used by the AG-04 safety gate."""
+        snapshot = {
+            "nodes": copy.deepcopy(graph.get("nodes", [])),
+            "edges": copy.deepcopy(graph.get("edges", [])),
+            "loops": copy.deepcopy(graph.get("loops", [])),
+        }
+        if include_connectors:
+            snapshot.update(
+                {
+                    "logical_connectors": copy.deepcopy(graph.get("logical_connectors", [])),
+                    "logical_connector_rejections": copy.deepcopy(
+                        graph.get("logical_connector_rejections", [])
+                    ),
+                }
+            )
+        return snapshot
+
+    @staticmethod
+    def _snapshot_sha256(snapshot: Dict[str, Any]) -> str:
+        return hashlib.sha256(_canonical_json(snapshot).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _health_evidence(report: Dict[str, Any]) -> Dict[str, Any]:
+        """Strip the reporter timestamp while retaining all deterministic diagnostics."""
+        return {
+            key: copy.deepcopy(report[key])
+            for key in ("status", "counts", "graph_metrics", "loop_metrics", "checks", "issues", "diagnostics")
+        }
+
+    @staticmethod
+    def _validator_outcome(validator: Any, graph: Dict[str, Any]) -> Dict[str, Any]:
+        from backend.topology_validator import TopologyValidationError
+
+        try:
+            validator.validate(graph)
+            return {"status": "VALIDATOR_PASS", "failed_checks": []}
+        except TopologyValidationError as exc:
+            return {"status": "VALIDATOR_FAIL", "failed_checks": [str(exc)]}
+
+    def qualify_floor_topology(
+        self,
+        source_views: Dict[str, Any],
+        entities: Sequence[AuditEntity],
+        include_transient_connectors: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Run isolated floor qualification; optionally add an AG-04 candidate projection."""
         if source_views.get("status") != "ready_for_review":
             return []
+
+        from backend.constraint_solver import ConstraintSolver
         from backend.geometry_engine import GeometryEngine
         from backend.topology_engine import TopologyEngine
-        from backend.topology_validator import TopologyValidationError, TopologyValidator
+        from backend.topology_health_report import TopologyHealthReporter
+        from backend.topology_validator import TopologyValidator
+        from backend.transient_boundary_connectors import generate_logical_connectors
 
         entity_by_id = {entity.source_id: entity for entity in entities}
         results = []
@@ -731,12 +782,73 @@ class DrawingRegionAudit:
                         "topology_stats": {key: value for key, value in topology.stats.items() if key != "processing_time_ms"},
                         "topology_sha256": topology.stats.get("topology_sha256", ""),
                     })
-                    try:
-                        validator.validate(graph)
-                        result["status"] = "VALIDATOR_PASS"
-                    except TopologyValidationError as exc:
-                        result["status"] = "VALIDATOR_FAIL"
-                        result["failed_checks"] = [str(exc)]
+                    baseline_outcome = self._validator_outcome(validator, graph)
+                    result.update(baseline_outcome)
+
+                    if include_transient_connectors:
+                        baseline_snapshot = self._topology_snapshot(graph)
+                        baseline_health = self._health_evidence(TopologyHealthReporter().build_report(graph))
+                        assigned_sources = [
+                            entity_by_id[source_id]
+                            for source_id in view["assigned_entity_ids"]
+                            if source_id in entity_by_id
+                        ]
+                        generation = generate_logical_connectors(graph, assigned_sources)
+                        candidate_input = copy.deepcopy(graph)
+                        candidate_input["logical_connectors"] = generation["logical_connectors"]
+
+                        solver = ConstraintSolver()
+                        solver.path_manager = _IsolatedPaths()
+                        candidate_graph = solver.run(candidate_input)
+                        physical_graph_unchanged = all(
+                            candidate_graph.get(key, []) == graph.get(key, [])
+                            for key in ("nodes", "edges", "loops")
+                        )
+                        candidate_health = self._health_evidence(
+                            TopologyHealthReporter().build_report(candidate_graph)
+                        )
+                        if physical_graph_unchanged:
+                            candidate_validator = TopologyValidator(
+                                report_output_path=str(
+                                    root / "outputs" / "topology_validation_candidate_report.json"
+                                )
+                            )
+                            candidate_outcome = self._validator_outcome(
+                                candidate_validator, candidate_graph
+                            )
+                        else:
+                            candidate_outcome = {
+                                "status": "NOT_EVALUATED",
+                                "failed_checks": ["PHYSICAL_GRAPH_CHANGED_BY_TRANSIENT_CONNECTOR_HANDOFF"],
+                            }
+
+                        candidate_snapshot = self._topology_snapshot(
+                            candidate_graph, include_connectors=True
+                        )
+                        result.update(
+                            {
+                                "baseline": {
+                                    **baseline_outcome,
+                                    "snapshot_sha256": self._snapshot_sha256(baseline_snapshot),
+                                    "health": baseline_health,
+                                },
+                                "candidate": {
+                                    **candidate_outcome,
+                                    "snapshot_sha256": self._snapshot_sha256(candidate_snapshot),
+                                    "physical_graph_unchanged": physical_graph_unchanged,
+                                    "logical_connectors": candidate_graph.get(
+                                        "logical_connectors", []
+                                    ),
+                                    "logical_connector_generation_rejections": generation[
+                                        "rejections"
+                                    ],
+                                    "logical_connector_validation_rejections": candidate_graph.get(
+                                        "logical_connector_rejections", []
+                                    ),
+                                    "health": candidate_health,
+                                },
+                            }
+                        )
                 except Exception as exc:
                     result["failed_checks"] = [f"Pipeline not evaluated: {type(exc).__name__}: {exc}"]
             results.append(result)
@@ -886,7 +998,9 @@ class DrawingRegionAudit:
         candidates, thresholds = self.extract_candidates(entities)
         source_views = self.build_source_views(entities)
         ab_comparisons = self.compare_ab_views(source_views, entities)
-        floor_topology = self.qualify_floor_topology(source_views, entities)
+        floor_topology = self.qualify_floor_topology(
+            source_views, entities, include_transient_connectors=True
+        )
         assigned = {member.fingerprint() for candidate in candidates for member in candidate.members}
         structural = [entity for entity in entities if entity.role == "structural"]
         bridge_context = sorted(

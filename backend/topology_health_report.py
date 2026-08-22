@@ -6,6 +6,7 @@ from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend.path_manager import PathManager
+from backend.transient_boundary_connectors import validate_logical_connectors
 
 
 class TopologyHealthReporter:
@@ -431,6 +432,8 @@ class TopologyHealthReporter:
         nodes = graph.get("nodes", [])
         edges = graph.get("edges", [])
         loops = graph.get("loops", [])
+        has_logical_connector_evidence = "logical_connectors" in graph
+        raw_logical_connectors = graph.get("logical_connectors", []) or []
 
         node_ids, invalid_node_ids = self._extract_valid_node_ids(nodes)
         adjacency = {node_id: set() for node_id in node_ids}
@@ -472,7 +475,34 @@ class TopologyHealthReporter:
 
             edge_pair_counts[tuple(sorted((from_id, to_id)))] += 1
 
-        components = self._compute_components(node_ids, adjacency) if node_ids else []
+        valid_logical_connectors: List[Dict[str, Any]] = []
+        logical_connector_rejections: List[Dict[str, Any]] = []
+        effective_adjacency = {node_id: set(neighbors) for node_id, neighbors in adjacency.items()}
+        effective_degrees = dict(degrees)
+        if has_logical_connector_evidence:
+            valid_logical_connectors, logical_connector_rejections = validate_logical_connectors(
+                nodes,
+                edges,
+                raw_logical_connectors,
+            )
+            for connector in valid_logical_connectors:
+                from_id, is_valid_from_id = self._try_parse_int(connector.get("from"))
+                to_id, is_valid_to_id = self._try_parse_int(connector.get("to"))
+                if (
+                    not is_valid_from_id
+                    or from_id is None
+                    or not is_valid_to_id
+                    or to_id is None
+                    or from_id not in effective_adjacency
+                    or to_id not in effective_adjacency
+                ):
+                    continue
+                effective_adjacency[from_id].add(to_id)
+                effective_adjacency[to_id].add(from_id)
+                effective_degrees[from_id] += 1
+                effective_degrees[to_id] += 1
+
+        components = self._compute_components(node_ids, effective_adjacency) if node_ids else []
         component_sizes = [len(component) for component in components]
         component_size_histogram = {
             str(size): count for size, count in sorted(Counter(component_sizes).items())
@@ -482,8 +512,12 @@ class TopologyHealthReporter:
             for component_index, component in enumerate(components)
             for node_id in component
         }
-        dangling_node_ids = sorted(node_id for node_id, degree in degrees.items() if degree == 1)
-        isolated_node_ids = sorted(node_id for node_id, degree in degrees.items() if degree == 0)
+        dangling_node_ids = sorted(
+            node_id for node_id, degree in effective_degrees.items() if degree == 1
+        )
+        isolated_node_ids = sorted(
+            node_id for node_id, degree in effective_degrees.items() if degree == 0
+        )
         dangling_node_component_indexes = sorted(
             {
                 component_index_by_node_id[node_id]
@@ -589,6 +623,8 @@ class TopologyHealthReporter:
             "face_edge_consistency": len(face_edge_inconsistency_loop_ids) == 0,
             "no_duplicate_undirected_edges": len(duplicate_edge_pairs) == 0,
         }
+        if has_logical_connector_evidence:
+            checks["logical_connector_integrity"] = len(logical_connector_rejections) == 0
 
         if (
             not checks["has_nodes"]
@@ -599,6 +635,7 @@ class TopologyHealthReporter:
             or not checks["node_coordinate_integrity"]
             or not checks["node_reference_integrity"]
             or not checks["no_self_loop_edges"]
+            or (has_logical_connector_evidence and not checks["logical_connector_integrity"])
         ):
             status = "CRITICAL"
         elif all(checks.values()):
@@ -861,45 +898,76 @@ class TopologyHealthReporter:
                     {"loop_ids": face_edge_inconsistency_loop_ids},
                 )
             )
+        if logical_connector_rejections:
+            message = f"Invalid logical connectors: {logical_connector_rejections}"
+            issues.append(message)
+            diagnostics.append(
+                self._build_diagnostic(
+                    "INVALID_LOGICAL_CONNECTORS",
+                    "CRITICAL",
+                    message,
+                    {"rejections": logical_connector_rejections},
+                )
+            )
 
         degree_histogram = {
             str(degree): count for degree, count in sorted(Counter(degrees.values()).items())
         }
+        counts = {
+            "nodes": len(nodes),
+            "edges": len(edges),
+            "loops": len(loops),
+        }
+        graph_metrics = {
+            "connected_components": len(component_sizes),
+            "component_sizes": component_sizes,
+            "component_node_groups": components,
+            "component_size_histogram": component_size_histogram,
+            "largest_component_size": component_sizes[0] if component_sizes else 0,
+            "dangling_node_count": len(dangling_node_ids),
+            "dangling_node_ids": dangling_node_ids,
+            "dangling_node_component_indexes": dangling_node_component_indexes,
+            "dangling_node_components": dangling_node_components,
+            "isolated_node_count": len(isolated_node_ids),
+            "isolated_node_ids": isolated_node_ids,
+            "isolated_node_component_indexes": isolated_node_component_indexes,
+            "isolated_node_components": isolated_node_components,
+            "self_loop_edge_count": len(self_loop_edge_ids),
+            "self_loop_edge_ids": self_loop_edge_ids,
+            "invalid_node_ids": invalid_node_ids,
+            "invalid_edge_ids": invalid_edge_ids,
+            "invalid_edge_endpoint_ids": invalid_edge_endpoint_ids,
+            "invalid_node_coordinate_ids": invalid_node_coordinate_ids,
+            "invalid_edge_reference_ids": invalid_edge_reference_ids,
+            "degree_metadata_mismatches": degree_metadata_mismatches,
+            "duplicate_undirected_edges": duplicate_edge_pairs,
+            "degree_histogram": degree_histogram,
+        }
+        if has_logical_connector_evidence:
+            counts.update(
+                {
+                    "physical_edges": len(edges),
+                    "logical_connectors": len(valid_logical_connectors),
+                    "effective_edges": len(edges) + len(valid_logical_connectors),
+                }
+            )
+            graph_metrics.update(
+                {
+                    "physical_degree_histogram": degree_histogram,
+                    "effective_degree_histogram": {
+                        str(degree): count
+                        for degree, count in sorted(Counter(effective_degrees.values()).items())
+                    },
+                    "logical_connector_rejections": logical_connector_rejections,
+                }
+            )
 
         return {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "reporter": "TopologyHealthReporter",
             "status": status,
-            "counts": {
-                "nodes": len(nodes),
-                "edges": len(edges),
-                "loops": len(loops),
-            },
-            "graph_metrics": {
-                "connected_components": len(component_sizes),
-                "component_sizes": component_sizes,
-                "component_node_groups": components,
-                "component_size_histogram": component_size_histogram,
-                "largest_component_size": component_sizes[0] if component_sizes else 0,
-                "dangling_node_count": len(dangling_node_ids),
-                "dangling_node_ids": dangling_node_ids,
-                "dangling_node_component_indexes": dangling_node_component_indexes,
-                "dangling_node_components": dangling_node_components,
-                "isolated_node_count": len(isolated_node_ids),
-                "isolated_node_ids": isolated_node_ids,
-                "isolated_node_component_indexes": isolated_node_component_indexes,
-                "isolated_node_components": isolated_node_components,
-                "self_loop_edge_count": len(self_loop_edge_ids),
-                "self_loop_edge_ids": self_loop_edge_ids,
-                "invalid_node_ids": invalid_node_ids,
-                "invalid_edge_ids": invalid_edge_ids,
-                "invalid_edge_endpoint_ids": invalid_edge_endpoint_ids,
-                "invalid_node_coordinate_ids": invalid_node_coordinate_ids,
-                "invalid_edge_reference_ids": invalid_edge_reference_ids,
-                "degree_metadata_mismatches": degree_metadata_mismatches,
-                "duplicate_undirected_edges": duplicate_edge_pairs,
-                "degree_histogram": degree_histogram,
-            },
+            "counts": counts,
+            "graph_metrics": graph_metrics,
             "loop_metrics": {
                 "closed_loop_count": closed_loop_count,
                 "open_loop_count": len(open_loop_ids),
